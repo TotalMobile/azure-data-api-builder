@@ -2359,7 +2359,7 @@ namespace Cli
                 args.Add(Startup.NO_HTTPS_REDIRECT_FLAG);
             }
 
-            return Azure.DataApiBuilder.Service.Program.StartEngine(args.ToArray());
+            return new Azure.DataApiBuilder.Service.Program().StartEngine(args.ToArray());
         }
 
         /// <summary>

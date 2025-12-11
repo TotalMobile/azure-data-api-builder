@@ -33,6 +33,11 @@ namespace Azure.DataApiBuilder.Service
 
         public static void Main(string[] args)
         {
+            new Program().MainImplementation(args);
+        }
+
+        protected void MainImplementation(string[] args)
+        {
             if (!ValidateAspNetCoreUrls())
             {
                 Console.Error.WriteLine("Invalid ASPNETCORE_URLS format. e.g.: ASPNETCORE_URLS=\"http://localhost:5000;https://localhost:5001\"");
@@ -46,7 +51,7 @@ namespace Azure.DataApiBuilder.Service
             }
         }
 
-        public static bool StartEngine(string[] args)
+        public bool StartEngine(string[] args)
         {
             // Unable to use ILogger because this code is invoked before LoggerFactory
             // is instantiated.
@@ -72,12 +77,13 @@ namespace Azure.DataApiBuilder.Service
             }
         }
 
-        public static IHostBuilder CreateHostBuilder(string[] args)
+        public IHostBuilder CreateHostBuilder(string[] args)
         {
             return Host.CreateDefaultBuilder(args)
                 .ConfigureAppConfiguration(builder =>
                 {
                     AddConfigurationProviders(builder, args);
+                    AddAdditionalConfigurationProviders(builder, args);
                 })
                 .ConfigureWebHostDefaults(webBuilder =>
                 {
@@ -85,8 +91,18 @@ namespace Azure.DataApiBuilder.Service
                     ILoggerFactory loggerFactory = GetLoggerFactoryForLogLevel(Startup.MinimumLogLevel);
                     ILogger<Startup> startupLogger = loggerFactory.CreateLogger<Startup>();
                     DisableHttpsRedirectionIfNeeded(args);
-                    webBuilder.UseStartup(builder => new Startup(builder.Configuration, startupLogger));
+                    webBuilder.UseStartup(builder => CreateStartup(builder.Configuration, startupLogger));
                 });
+        }
+
+        protected virtual void AddAdditionalConfigurationProviders(IConfigurationBuilder builder, string[] args)
+        {
+            // Meant to be overridden in derived classes for adding additional configuration providers.
+        }
+
+        protected virtual Startup CreateStartup(IConfiguration configuration, ILogger<Startup> startupLogger)
+        {
+            return new Startup(configuration, startupLogger);
         }
 
         /// <summary>
