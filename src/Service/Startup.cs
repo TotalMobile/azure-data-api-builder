@@ -817,6 +817,8 @@ namespace Azure.DataApiBuilder.Service
                 app.UseDeveloperExceptionPage();
             }
 
+            ConfigureAdditionalMiddleware(app, env, runtimeConfig);
+
             if (!Program.IsHttpsRedirectionDisabled)
             {
                 // Use HTTPS redirection for all endpoints except /health and /graphql.
@@ -929,6 +931,11 @@ namespace Azure.DataApiBuilder.Service
                     ResponseWriter = app.ApplicationServices.GetRequiredService<BasicHealthReportResponseWriter>().WriteResponse
                 });
             });
+        }
+
+        protected virtual void ConfigureAdditionalMiddleware(IApplicationBuilder app, IWebHostEnvironment env, RuntimeConfig? runtimeConfig)
+        {
+
         }
 
         /// <summary>
