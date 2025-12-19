@@ -50,7 +50,7 @@ namespace Azure.DataApiBuilder.Core.Resolvers
 
         /// <summary>
         /// The saved cached access token obtained from DefaultAzureCredentials
-        /// representing a managed identity. 
+        /// representing a managed identity.
         /// </summary>
         private AccessToken? _defaultAccessToken;
 
@@ -118,16 +118,11 @@ namespace Azure.DataApiBuilder.Core.Resolvers
         /// <exception cref="DataApiBuilderException">Exception thrown if datasource is not found.</exception>
         public override SqlConnection CreateConnection(string dataSourceName)
         {
-            if (!ConnectionStringBuilders.ContainsKey(dataSourceName))
-            {
-                throw new DataApiBuilderException("Query execution failed. Could not find datasource to execute query against", HttpStatusCode.BadRequest, DataApiBuilderException.SubStatusCodes.DataSourceNotFound);
-            }
-
             string connectionString = GetConnectionStringForCurrentUser(dataSourceName);
 
             SqlConnection conn = new()
             {
-                ConnectionString = connectionString,
+                ConnectionString = connectionString
             };
 
             // Extract info message from SQLConnection
@@ -161,6 +156,17 @@ namespace Azure.DataApiBuilder.Core.Resolvers
             return conn;
         }
 
+        protected virtual string GetConnectionString(string dataSourceName)
+        {
+            if (!ConnectionStringBuilders.ContainsKey(dataSourceName))
+            {
+                throw new DataApiBuilderException("Query execution failed. Could not find datasource to execute query against", HttpStatusCode.BadRequest, DataApiBuilderException.SubStatusCodes.DataSourceNotFound);
+            }
+
+            string connectionString = ConnectionStringBuilders[dataSourceName].ConnectionString;
+            return connectionString;
+        }
+
         /// <summary>
         /// Gets the connection string for the current user. For OBO-enabled data sources,
         /// this returns a connection string with a user-specific Application Name to isolate
@@ -170,7 +176,7 @@ namespace Azure.DataApiBuilder.Core.Resolvers
         /// <returns>The connection string to use for the current request.</returns>
         private string GetConnectionStringForCurrentUser(string dataSourceName)
         {
-            string baseConnectionString = ConnectionStringBuilders[dataSourceName].ConnectionString;
+            string baseConnectionString = GetConnectionString(dataSourceName);
 
             // Per-user pooling is automatic when OBO is enabled.
             // _dataSourceBaseAppName is only populated for data sources with user-delegated-auth enabled.

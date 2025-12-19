@@ -70,6 +70,11 @@ namespace Azure.DataApiBuilder.Service
 
         public static void Main(string[] args)
         {
+            new Program().MainImplementation(args);
+        }
+
+        protected void MainImplementation(string[] args)
+        {
             bool runMcpStdio = McpStdioHelper.ShouldRunMcpStdio(args, out string? mcpRole);
 
             if (runMcpStdio)
@@ -91,7 +96,7 @@ namespace Azure.DataApiBuilder.Service
             }
         }
 
-        public static bool StartEngine(string[] args, bool runMcpStdio, string? mcpRole)
+        public bool StartEngine(string[] args, bool runMcpStdio, string? mcpRole)
         {
             try
             {
@@ -147,18 +152,19 @@ namespace Azure.DataApiBuilder.Service
         }
 
         // Compatibility overload used by external callers that do not pass the runMcpStdio flag.
-        public static bool StartEngine(string[] args)
+        public bool StartEngine(string[] args)
         {
             bool runMcpStdio = McpStdioHelper.ShouldRunMcpStdio(args, out string? mcpRole);
             return StartEngine(args, runMcpStdio, mcpRole: mcpRole);
         }
 
-        public static IHostBuilder CreateHostBuilder(string[] args, bool runMcpStdio, string? mcpRole)
+        public IHostBuilder CreateHostBuilder(string[] args, bool runMcpStdio, string? mcpRole)
         {
             return Host.CreateDefaultBuilder(args)
                 .ConfigureAppConfiguration(builder =>
                 {
                     AddConfigurationProviders(builder, args);
+                    AddAdditionalConfigurationProviders(builder, args);
                     if (runMcpStdio)
                     {
                         McpStdioHelper.ConfigureMcpStdio(builder, mcpRole);
@@ -216,8 +222,18 @@ namespace Azure.DataApiBuilder.Service
                     ILoggerFactory loggerFactory = GetLoggerFactoryForLogLevel(Startup.MinimumLogLevel, stdio: runMcpStdio);
                     ILogger<Startup> startupLogger = loggerFactory.CreateLogger<Startup>();
                     DisableHttpsRedirectionIfNeeded(args);
-                    webBuilder.UseStartup(builder => new Startup(builder.Configuration, startupLogger));
+                    webBuilder.UseStartup(builder => CreateStartup(builder.Configuration, startupLogger));
                 });
+        }
+
+        protected virtual void AddAdditionalConfigurationProviders(IConfigurationBuilder builder, string[] args)
+        {
+            // Meant to be overridden in derived classes for adding additional configuration providers.
+        }
+
+        protected virtual Startup CreateStartup(IConfiguration configuration, ILogger<Startup> startupLogger)
+        {
+            return new Startup(configuration, startupLogger);
         }
 
         /// <summary>

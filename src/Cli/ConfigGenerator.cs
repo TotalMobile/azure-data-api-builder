@@ -2821,7 +2821,7 @@ namespace Cli
                 args.Add(effectiveRole);
             }
 
-            return Azure.DataApiBuilder.Service.Program.StartEngine(args.ToArray());
+            return new Azure.DataApiBuilder.Service.Program().StartEngine(args.ToArray());
         }
 
         /// <summary>
