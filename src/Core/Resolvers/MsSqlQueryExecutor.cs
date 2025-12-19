@@ -48,7 +48,7 @@ namespace Azure.DataApiBuilder.Core.Resolvers
 
         /// <summary>
         /// The saved cached access token obtained from DefaultAzureCredentials
-        /// representing a managed identity. 
+        /// representing a managed identity.
         /// </summary>
         private AccessToken? _defaultAccessToken;
 
@@ -94,14 +94,11 @@ namespace Azure.DataApiBuilder.Core.Resolvers
         /// <exception cref="DataApiBuilderException">Exception thrown if datasource is not found.</exception>
         public override SqlConnection CreateConnection(string dataSourceName)
         {
-            if (!ConnectionStringBuilders.ContainsKey(dataSourceName))
-            {
-                throw new DataApiBuilderException("Query execution failed. Could not find datasource to execute query against", HttpStatusCode.BadRequest, DataApiBuilderException.SubStatusCodes.DataSourceNotFound);
-            }
+            string connectionString = GetConnectionString(dataSourceName);
 
             SqlConnection conn = new()
             {
-                ConnectionString = ConnectionStringBuilders[dataSourceName].ConnectionString,
+                ConnectionString = connectionString
             };
 
             // Extract info message from SQLConnection
@@ -133,6 +130,17 @@ namespace Azure.DataApiBuilder.Core.Resolvers
             };
 
             return conn;
+        }
+
+        protected virtual string GetConnectionString(string dataSourceName)
+        {
+            if (!ConnectionStringBuilders.ContainsKey(dataSourceName))
+            {
+                throw new DataApiBuilderException("Query execution failed. Could not find datasource to execute query against", HttpStatusCode.BadRequest, DataApiBuilderException.SubStatusCodes.DataSourceNotFound);
+            }
+
+            string connectionString = ConnectionStringBuilders[dataSourceName].ConnectionString;
+            return connectionString;
         }
 
         /// <summary>

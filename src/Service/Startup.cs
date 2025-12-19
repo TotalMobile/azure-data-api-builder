@@ -476,8 +476,8 @@ namespace Azure.DataApiBuilder.Service
                 .AddHttpRequestInterceptor<DefaultHttpRequestInterceptor>()
                 .ConfigureSchema((serviceProvider, schemaBuilder) =>
                 {
-                    // The GraphQLSchemaCreator is an application service that is not available on 
-                    // the schema specific service provider, this means we have to get it with 
+                    // The GraphQLSchemaCreator is an application service that is not available on
+                    // the schema specific service provider, this means we have to get it with
                     // the GetRootServiceProvider helper.
                     GraphQLSchemaCreator graphQLService = serviceProvider.GetRootServiceProvider().GetRequiredService<GraphQLSchemaCreator>();
                     graphQLService.InitializeSchemaAndResolvers(schemaBuilder);
@@ -593,6 +593,8 @@ namespace Azure.DataApiBuilder.Service
             {
                 app.UseDeveloperExceptionPage();
             }
+
+            ConfigureAdditionalMiddleware(app, env, runtimeConfig);
 
             if (!Program.IsHttpsRedirectionDisabled)
             {
@@ -711,6 +713,11 @@ namespace Azure.DataApiBuilder.Service
                     ResponseWriter = app.ApplicationServices.GetRequiredService<BasicHealthReportResponseWriter>().WriteResponse
                 });
             });
+        }
+
+        protected virtual void ConfigureAdditionalMiddleware(IApplicationBuilder app, IWebHostEnvironment env, RuntimeConfig? runtimeConfig)
+        {
+
         }
 
         /// <summary>
