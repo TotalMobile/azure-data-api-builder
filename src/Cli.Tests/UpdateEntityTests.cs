@@ -301,7 +301,7 @@ namespace Cli.Tests
             UpdateOptions options = GenerateBaseUpdateOptions(
                 source: "MyTable",
                 cacheEnabled: "true",
-                cacheTtl: "1"
+                cacheTtlSeconds: "1"
             );
 
             string initialConfig = GetInitialConfigString() + "," + @"
@@ -1100,6 +1100,94 @@ namespace Cli.Tests
             Assert.AreEqual("Updated description", updatedRuntimeConfig.Entities["MyEntity"].Description);
         }
 
+        /// <summary>
+        /// Updating a field's description should either preserve or clear
+        /// the existing primary-key flag depending on whether an explicit
+        /// --fields.primary-key value is provided.
+        /// </summary>
+        [DataTestMethod]
+        [DataRow(null, true, DisplayName = "No primary-key flag: preserve existing true")]
+        [DataRow(false, false, DisplayName = "Explicit primary-key false: clear existing true")]
+        public void TestUpdateFieldDescriptionPrimaryKeyBehavior(bool? primaryKeyFlag, bool expectedPrimaryKey)
+        {
+            string initialConfig = GetInitialConfigString() + "," + @"
+                ""entities"": {
+                    ""MyEntity"": {
+                        ""source"": ""MyTable"",
+                        ""fields"": [
+                            {
+                                ""name"": ""Id"",
+                                ""description"": ""Primary key"",
+                                ""primary-key"": true
+                            }
+                        ],
+                        ""permissions"": [
+                            {
+                                ""role"": ""anonymous"",
+                                ""actions"": [""read""]
+                            }
+                        ]
+                    }
+                }
+            }";
+
+            IEnumerable<bool>? primaryKeyFlags = primaryKeyFlag.HasValue
+                ? new[] { primaryKeyFlag.Value }
+                : null;
+
+            UpdateOptions options = new(
+                source: null,
+                permissions: null,
+                entity: "MyEntity",
+                sourceType: null,
+                sourceParameters: null,
+                sourceKeyFields: null,
+                restRoute: null,
+                graphQLType: null,
+                fieldsToInclude: null,
+                fieldsToExclude: null,
+                policyRequest: null,
+                policyDatabase: null,
+                relationship: null,
+                cardinality: null,
+                targetEntity: null,
+                linkingObject: null,
+                linkingSourceFields: null,
+                linkingTargetFields: null,
+                relationshipFields: null,
+                map: null,
+                cacheEnabled: null,
+                cacheTtlSeconds: null,
+                cacheLevel: null,
+                healthEnabled: null,
+                config: TEST_RUNTIME_CONFIG_FILE,
+                restMethodsForStoredProcedure: null,
+                graphQLOperationForStoredProcedure: null,
+                description: null,
+                parametersNameCollection: null,
+                parametersDescriptionCollection: null,
+                parametersRequiredCollection: null,
+                parametersDefaultCollection: null,
+                fieldsNameCollection: new[] { "Id" },
+                fieldsAliasCollection: null,
+                fieldsDescriptionCollection: new[] { "Unique Key" },
+                fieldsPrimaryKeyCollection: primaryKeyFlags,
+                mcpDmlTools: null,
+                mcpCustomTool: null
+            );
+
+            Assert.IsTrue(RuntimeConfigLoader.TryParseConfig(initialConfig, out RuntimeConfig? runtimeConfig), "Parsed config file.");
+            Assert.IsTrue(TryUpdateExistingEntity(options, runtimeConfig!, out RuntimeConfig updatedRuntimeConfig), "Successfully updated entity in the config.");
+
+            Entity updatedEntity = updatedRuntimeConfig.Entities["MyEntity"];
+            Assert.IsNotNull(updatedEntity.Fields);
+            Assert.AreEqual(1, updatedEntity.Fields!.Count);
+            FieldMetadata field = updatedEntity.Fields[0];
+            Assert.AreEqual("Id", field.Name);
+            Assert.AreEqual("Unique Key", field.Description);
+            Assert.AreEqual(expectedPrimaryKey, field.PrimaryKey);
+        }
+
         private static string GetInitialConfigString()
         {
             return @"{" +
@@ -1125,7 +1213,7 @@ namespace Cli.Tests
                                     ""allow-credentials"": false
                                 },
                                 ""authentication"": {
-                                    ""provider"": ""StaticWebApps"",
+                                    ""provider"": ""Unauthenticated"",
                                     ""jwt"": {
                                     ""audience"": """",
                                     ""issuer"": """"
@@ -1159,8 +1247,12 @@ namespace Cli.Tests
             IEnumerable<string>? restMethodsForStoredProcedure = null,
             string? graphQLOperationForStoredProcedure = null,
             string? cacheEnabled = null,
-            string? cacheTtl = null,
-            string? description = null
+            string? cacheTtlSeconds = null,
+            string? cacheLevel = null,
+            string? healthEnabled = null,
+            string? description = null,
+            string? mcpDmlTools = null,
+            string? mcpCustomTool = null
             )
         {
             return new(
@@ -1185,7 +1277,9 @@ namespace Cli.Tests
                 relationshipFields: relationshipFields,
                 map: map,
                 cacheEnabled: cacheEnabled,
-                cacheTtl: cacheTtl,
+                cacheTtlSeconds: cacheTtlSeconds,
+                cacheLevel: cacheLevel,
+                healthEnabled: healthEnabled,
                 config: TEST_RUNTIME_CONFIG_FILE,
                 restMethodsForStoredProcedure: restMethodsForStoredProcedure,
                 graphQLOperationForStoredProcedure: graphQLOperationForStoredProcedure,
@@ -1197,7 +1291,9 @@ namespace Cli.Tests
                 fieldsNameCollection: null,
                 fieldsAliasCollection: null,
                 fieldsDescriptionCollection: null,
-                fieldsPrimaryKeyCollection: null
+                fieldsPrimaryKeyCollection: null,
+                mcpDmlTools: mcpDmlTools,
+                mcpCustomTool: mcpCustomTool
             );
         }
 
@@ -1211,5 +1307,513 @@ namespace Cli.Tests
 
             return Verify(updatedRuntimeConfig, settings);
         }
+
+        #region MCP Entity Configuration Tests
+
+        /// <summary>
+        /// Test updating table entity with MCP dml-tools from false to true, or true to false
+        /// Tests actual update scenario where existing MCP config is modified
+        /// </summary>
+        [DataTestMethod]
+        [DataRow("true", "false", DisplayName = "TestUpdateTableEntityWithMcpDmlToolsEnabled")]
+        [DataRow("false", "true", DisplayName = "TestUpdateTableEntityWithMcpDmlToolsDisabled")]
+        public Task TestUpdateTableEntityWithMcpDmlTools(string newMcpDmlTools, string initialMcpDmlTools)
+        {
+            UpdateOptions options = new(
+                source: null,
+                permissions: null,
+                entity: "MyEntity",
+                sourceType: null,
+                sourceParameters: null,
+                sourceKeyFields: null,
+                restRoute: null,
+                graphQLType: null,
+                fieldsToInclude: null,
+                fieldsToExclude: null,
+                policyRequest: null,
+                policyDatabase: null,
+                relationship: null,
+                cardinality: null,
+                targetEntity: null,
+                linkingObject: null,
+                linkingSourceFields: null,
+                linkingTargetFields: null,
+                relationshipFields: null,
+                map: null,
+                cacheEnabled: null,
+                cacheTtlSeconds: null,
+                cacheLevel: null,
+                healthEnabled: null,
+                config: TEST_RUNTIME_CONFIG_FILE,
+                restMethodsForStoredProcedure: null,
+                graphQLOperationForStoredProcedure: null,
+                description: null,
+                parametersNameCollection: null,
+                parametersDescriptionCollection: null,
+                parametersRequiredCollection: null,
+                parametersDefaultCollection: null,
+                fieldsNameCollection: null,
+                fieldsAliasCollection: null,
+                fieldsDescriptionCollection: null,
+                fieldsPrimaryKeyCollection: null,
+                mcpDmlTools: newMcpDmlTools,
+                mcpCustomTool: null
+            );
+
+            string initialConfig = GetInitialConfigString() + "," + @"
+                    ""entities"": {
+                            ""MyEntity"": {
+                                ""source"": ""MyTable"",
+                                ""permissions"": [
+                                    {
+                                        ""role"": ""anonymous"",
+                                        ""actions"": [""*""]
+                                    }
+                                ],
+                                ""mcp"": " + initialMcpDmlTools + @"
+                            }
+                        }
+                    }";
+
+            VerifySettings settings = new();
+            settings.UseParameters(newMcpDmlTools);
+            return ExecuteVerifyTest(initialConfig, options, settings: settings);
+        }
+
+        /// <summary>
+        /// Test updating stored procedure with MCP custom-tool from false to true
+        /// Tests actual update scenario where existing MCP config is modified
+        /// </summary>
+        [TestMethod]
+        public Task TestUpdateStoredProcedureWithMcpCustomToolEnabled()
+        {
+            UpdateOptions options = new(
+                source: null,
+                permissions: null,
+                entity: "GetBookById",
+                sourceType: null,
+                sourceParameters: null,
+                sourceKeyFields: null,
+                restRoute: null,
+                graphQLType: null,
+                fieldsToInclude: null,
+                fieldsToExclude: null,
+                policyRequest: null,
+                policyDatabase: null,
+                relationship: null,
+                cardinality: null,
+                targetEntity: null,
+                linkingObject: null,
+                linkingSourceFields: null,
+                linkingTargetFields: null,
+                relationshipFields: null,
+                map: null,
+                cacheEnabled: null,
+                cacheTtlSeconds: null,
+                cacheLevel: null,
+                healthEnabled: null,
+                config: TEST_RUNTIME_CONFIG_FILE,
+                restMethodsForStoredProcedure: null,
+                graphQLOperationForStoredProcedure: null,
+                description: null,
+                parametersNameCollection: null,
+                parametersDescriptionCollection: null,
+                parametersRequiredCollection: null,
+                parametersDefaultCollection: null,
+                fieldsNameCollection: null,
+                fieldsAliasCollection: null,
+                fieldsDescriptionCollection: null,
+                fieldsPrimaryKeyCollection: null,
+                mcpDmlTools: null,
+                mcpCustomTool: "true"
+            );
+
+            string initialConfig = GetInitialConfigString() + "," + @"
+                    ""entities"": {
+                            ""GetBookById"": {
+                                ""source"": ""dbo.GetBookById"",
+                                ""source"": {
+                                    ""type"": ""stored-procedure""
+                                },
+                                ""permissions"": [
+                                    {
+                                        ""role"": ""anonymous"",
+                                        ""actions"": [""execute""]
+                                    }
+                                ],
+                                ""mcp"": {
+                                    ""custom-tool"": false
+                                }
+                            }
+                        }
+                    }";
+
+            return ExecuteVerifyTest(initialConfig, options);
+        }
+
+        /// <summary>
+        /// Test updating stored procedure with both MCP properties
+        /// Updates from both true to custom-tool=true, dml-tools=false
+        /// </summary>
+        [TestMethod]
+        public Task TestUpdateStoredProcedureWithBothMcpProperties()
+        {
+            UpdateOptions options = new(
+                source: null,
+                permissions: null,
+                entity: "UpdateBook",
+                sourceType: null,
+                sourceParameters: null,
+                sourceKeyFields: null,
+                restRoute: null,
+                graphQLType: null,
+                fieldsToInclude: null,
+                fieldsToExclude: null,
+                policyRequest: null,
+                policyDatabase: null,
+                relationship: null,
+                cardinality: null,
+                targetEntity: null,
+                linkingObject: null,
+                linkingSourceFields: null,
+                linkingTargetFields: null,
+                relationshipFields: null,
+                map: null,
+                cacheEnabled: null,
+                cacheTtlSeconds: null,
+                cacheLevel: null,
+                healthEnabled: null,
+                config: TEST_RUNTIME_CONFIG_FILE,
+                restMethodsForStoredProcedure: null,
+                graphQLOperationForStoredProcedure: null,
+                description: null,
+                parametersNameCollection: null,
+                parametersDescriptionCollection: null,
+                parametersRequiredCollection: null,
+                parametersDefaultCollection: null,
+                fieldsNameCollection: null,
+                fieldsAliasCollection: null,
+                fieldsDescriptionCollection: null,
+                fieldsPrimaryKeyCollection: null,
+                mcpDmlTools: "false",
+                mcpCustomTool: "true"
+            );
+
+            string initialConfig = GetInitialConfigString() + "," + @"
+                    ""entities"": {
+                            ""UpdateBook"": {
+                                ""source"": ""dbo.UpdateBook"",
+                                ""source"": {
+                                    ""type"": ""stored-procedure""
+                                },
+                                ""permissions"": [
+                                    {
+                                        ""role"": ""anonymous"",
+                                        ""actions"": [""execute""]
+                                    }
+                                ],
+                                ""mcp"": {
+                                    ""custom-tool"": false,
+                                    ""dml-tools"": true
+                                }
+                            }
+                        }
+                    }";
+
+            return ExecuteVerifyTest(initialConfig, options);
+        }
+
+        /// <summary>
+        /// Test updating stored procedure with both MCP properties enabled
+        /// Updates from both false to both true
+        /// </summary>
+        [TestMethod]
+        public Task TestUpdateStoredProcedureWithBothMcpPropertiesEnabled()
+        {
+            UpdateOptions options = new(
+                source: null,
+                permissions: null,
+                entity: "GetAllBooks",
+                sourceType: null,
+                sourceParameters: null,
+                sourceKeyFields: null,
+                restRoute: null,
+                graphQLType: null,
+                fieldsToInclude: null,
+                fieldsToExclude: null,
+                policyRequest: null,
+                policyDatabase: null,
+                relationship: null,
+                cardinality: null,
+                targetEntity: null,
+                linkingObject: null,
+                linkingSourceFields: null,
+                linkingTargetFields: null,
+                relationshipFields: null,
+                map: null,
+                cacheEnabled: null,
+                cacheTtlSeconds: null,
+                cacheLevel: null,
+                healthEnabled: null,
+                config: TEST_RUNTIME_CONFIG_FILE,
+                restMethodsForStoredProcedure: null,
+                graphQLOperationForStoredProcedure: null,
+                description: null,
+                parametersNameCollection: null,
+                parametersDescriptionCollection: null,
+                parametersRequiredCollection: null,
+                parametersDefaultCollection: null,
+                fieldsNameCollection: null,
+                fieldsAliasCollection: null,
+                fieldsDescriptionCollection: null,
+                fieldsPrimaryKeyCollection: null,
+                mcpDmlTools: "true",
+                mcpCustomTool: "true"
+            );
+
+            string initialConfig = GetInitialConfigString() + "," + @"
+                    ""entities"": {
+                            ""GetAllBooks"": {
+                                ""source"": ""dbo.GetAllBooks"",
+                                ""source"": {
+                                    ""type"": ""stored-procedure""
+                                },
+                                ""permissions"": [
+                                    {
+                                        ""role"": ""anonymous"",
+                                        ""actions"": [""execute""]
+                                    }
+                                ],
+                                ""mcp"": {
+                                    ""custom-tool"": false,
+                                    ""dml-tools"": false
+                                }
+                            }
+                        }
+                    }";
+
+            return ExecuteVerifyTest(initialConfig, options);
+        }
+
+        /// <summary>
+        /// Test that updating table entity with custom-tool fails validation
+        /// </summary>
+        [TestMethod]
+        public void TestUpdateTableEntityWithInvalidMcpCustomTool()
+        {
+            UpdateOptions options = new(
+                source: null,
+                permissions: null,
+                entity: "MyEntity",
+                sourceType: null,
+                sourceParameters: null,
+                sourceKeyFields: null,
+                restRoute: null,
+                graphQLType: null,
+                fieldsToInclude: null,
+                fieldsToExclude: null,
+                policyRequest: null,
+                policyDatabase: null,
+                relationship: null,
+                cardinality: null,
+                targetEntity: null,
+                linkingObject: null,
+                linkingSourceFields: null,
+                linkingTargetFields: null,
+                relationshipFields: null,
+                map: null,
+                cacheEnabled: null,
+                cacheTtlSeconds: null,
+                cacheLevel: null,
+                healthEnabled: null,
+                config: TEST_RUNTIME_CONFIG_FILE,
+                restMethodsForStoredProcedure: null,
+                graphQLOperationForStoredProcedure: null,
+                description: null,
+                parametersNameCollection: null,
+                parametersDescriptionCollection: null,
+                parametersRequiredCollection: null,
+                parametersDefaultCollection: null,
+                fieldsNameCollection: null,
+                fieldsAliasCollection: null,
+                fieldsDescriptionCollection: null,
+                fieldsPrimaryKeyCollection: null,
+                mcpDmlTools: null,
+                mcpCustomTool: "true"
+            );
+
+            string initialConfig = GetInitialConfigString() + "," + @"
+                    ""entities"": {
+                            ""MyEntity"": {
+                                ""source"": ""MyTable"",
+                                ""permissions"": [
+                                    {
+                                        ""role"": ""anonymous"",
+                                        ""actions"": [""*""]
+                                    }
+                                ]
+                            }
+                        }
+                    }";
+
+            Assert.IsTrue(RuntimeConfigLoader.TryParseConfig(initialConfig, out RuntimeConfig? runtimeConfig));
+
+            Assert.IsFalse(TryUpdateExistingEntity(options, runtimeConfig!, out RuntimeConfig _),
+                "Should fail to update table entity with custom-tool enabled");
+        }
+
+        /// <summary>
+        /// Test that invalid MCP option value fails
+        /// </summary>
+        [DataTestMethod]
+        [DataRow("invalid", null, DisplayName = "Invalid dml-tools value")]
+        [DataRow(null, "invalid", DisplayName = "Invalid custom-tool value")]
+        [DataRow("yes", "no", DisplayName = "Invalid boolean-like values")]
+        public void TestUpdateEntityWithInvalidMcpOptions(string? mcpDmlTools, string? mcpCustomTool)
+        {
+            UpdateOptions options = new(
+                source: null,
+                permissions: null,
+                entity: "MyEntity",
+                sourceType: null,
+                sourceParameters: null,
+                sourceKeyFields: null,
+                restRoute: null,
+                graphQLType: null,
+                fieldsToInclude: null,
+                fieldsToExclude: null,
+                policyRequest: null,
+                policyDatabase: null,
+                relationship: null,
+                cardinality: null,
+                targetEntity: null,
+                linkingObject: null,
+                linkingSourceFields: null,
+                linkingTargetFields: null,
+                relationshipFields: null,
+                map: null,
+                cacheEnabled: null,
+                cacheTtlSeconds: null,
+                cacheLevel: null,
+                healthEnabled: null,
+                config: TEST_RUNTIME_CONFIG_FILE,
+                restMethodsForStoredProcedure: null,
+                graphQLOperationForStoredProcedure: null,
+                description: null,
+                parametersNameCollection: null,
+                parametersDescriptionCollection: null,
+                parametersRequiredCollection: null,
+                parametersDefaultCollection: null,
+                fieldsNameCollection: null,
+                fieldsAliasCollection: null,
+                fieldsDescriptionCollection: null,
+                fieldsPrimaryKeyCollection: null,
+                mcpDmlTools: mcpDmlTools,
+                mcpCustomTool: mcpCustomTool
+            );
+
+            string initialConfig = GetInitialConfigString() + "," + @"
+                    ""entities"": {
+                            ""MyEntity"": {
+                                ""source"": ""MyTable"",
+                                ""permissions"": [
+                                    {
+                                        ""role"": ""anonymous"",
+                                        ""actions"": [""*""]
+                                    }
+                                ]
+                            }
+                        }
+                    }";
+
+            Assert.IsTrue(RuntimeConfigLoader.TryParseConfig(initialConfig, out RuntimeConfig? runtimeConfig));
+
+            Assert.IsFalse(TryUpdateExistingEntity(options, runtimeConfig!, out RuntimeConfig _),
+                $"Should fail to update entity with invalid MCP options: dml-tools={mcpDmlTools}, custom-tool={mcpCustomTool}");
+        }
+
+        #endregion MCP Entity Configuration Tests
+
+        #region Entity Cache Level and Health Tests
+
+        /// <summary>
+        /// Tests updating an entity's cache level.
+        /// Command: dab update MyEntity --cache.level L1L2
+        /// </summary>
+        [DataTestMethod]
+        [DataRow("L1", DisplayName = "Set cache level to L1")]
+        [DataRow("L1L2", DisplayName = "Set cache level to L1L2")]
+        public void TestUpdateEntityCacheLevel(string level)
+        {
+            UpdateOptions options = GenerateBaseUpdateOptions(
+                source: "MyTable",
+                cacheEnabled: "true",
+                cacheLevel: level
+            );
+
+            string initialConfig = GetInitialConfigString() + "," + @"
+                    ""entities"": {
+                            ""MyEntity"": {
+                                ""source"": ""MyTable"",
+                                ""permissions"": [
+                                    {
+                                        ""role"": ""anonymous"",
+                                        ""actions"": [""*""]
+                                    }
+                                ],
+                                ""cache"": {
+                                    ""enabled"": false,
+                                    ""ttl-seconds"": 5
+                                }
+                            }
+                        }
+                    }";
+
+            Assert.IsTrue(RuntimeConfigLoader.TryParseConfig(initialConfig, out RuntimeConfig? runtimeConfig), "Parsed config file.");
+            Assert.IsTrue(TryUpdateExistingEntity(options, runtimeConfig!, out RuntimeConfig updatedRuntimeConfig), "Successfully updated entity in the config.");
+
+            Entity updatedEntity = updatedRuntimeConfig.Entities["MyEntity"];
+            Assert.IsNotNull(updatedEntity.Cache);
+            Assert.IsTrue(updatedEntity.Cache.Enabled);
+            Assert.AreEqual(Enum.Parse<EntityCacheLevel>(level, ignoreCase: true), updatedEntity.Cache.Level);
+        }
+
+        /// <summary>
+        /// Tests updating an entity's health enabled setting.
+        /// Command: dab update MyEntity --health.enabled true
+        /// </summary>
+        [DataTestMethod]
+        [DataRow("true", DisplayName = "Enable entity health")]
+        [DataRow("false", DisplayName = "Disable entity health")]
+        public void TestUpdateEntityHealthEnabled(string healthEnabled)
+        {
+            UpdateOptions options = GenerateBaseUpdateOptions(
+                source: "MyTable",
+                healthEnabled: healthEnabled
+            );
+
+            string initialConfig = GetInitialConfigString() + "," + @"
+                    ""entities"": {
+                            ""MyEntity"": {
+                                ""source"": ""MyTable"",
+                                ""permissions"": [
+                                    {
+                                        ""role"": ""anonymous"",
+                                        ""actions"": [""*""]
+                                    }
+                                ]
+                            }
+                        }
+                    }";
+
+            Assert.IsTrue(RuntimeConfigLoader.TryParseConfig(initialConfig, out RuntimeConfig? runtimeConfig), "Parsed config file.");
+            Assert.IsTrue(TryUpdateExistingEntity(options, runtimeConfig!, out RuntimeConfig updatedRuntimeConfig), "Successfully updated entity in the config.");
+
+            Entity updatedEntity = updatedRuntimeConfig.Entities["MyEntity"];
+            Assert.IsNotNull(updatedEntity.Health);
+            Assert.AreEqual(bool.Parse(healthEnabled), updatedEntity.Health.Enabled);
+        }
+
+        #endregion Entity Cache Level and Health Tests
     }
 }

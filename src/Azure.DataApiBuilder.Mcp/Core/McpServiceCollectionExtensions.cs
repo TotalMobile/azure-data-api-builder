@@ -38,8 +38,11 @@ namespace Azure.DataApiBuilder.Mcp.Core
             // Auto-discover and register all MCP tools
             RegisterAllMcpTools(services);
 
-            // Configure MCP server
-            services.ConfigureMcpServer();
+            // Register custom tools from configuration
+            RegisterCustomTools(services, runtimeConfig);
+
+            // Configure MCP server and propagate runtime description to MCP initialize instructions.
+            services.ConfigureMcpServer(runtimeConfig.Runtime?.Mcp?.Description);
 
             return services;
         }
@@ -54,11 +57,24 @@ namespace Azure.DataApiBuilder.Mcp.Core
             IEnumerable<Type> toolTypes = mcpAssembly.GetTypes()
                 .Where(t => t.IsClass &&
                            !t.IsAbstract &&
-                           typeof(IMcpTool).IsAssignableFrom(t));
+                           typeof(IMcpTool).IsAssignableFrom(t) &&
+                           t != typeof(DynamicCustomTool)); // Exclude DynamicCustomTool from auto-registration
 
             foreach (Type toolType in toolTypes)
             {
                 services.AddSingleton(typeof(IMcpTool), toolType);
+            }
+        }
+
+        /// <summary>
+        /// Registers custom MCP tools generated from stored procedure entity configurations.
+        /// </summary>
+        private static void RegisterCustomTools(IServiceCollection services, RuntimeConfig config)
+        {
+            // Create custom tools and register each as a singleton
+            foreach (IMcpTool customTool in CustomMcpToolFactory.CreateCustomTools(config))
+            {
+                services.AddSingleton<IMcpTool>(customTool);
             }
         }
     }

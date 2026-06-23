@@ -1,8 +1,10 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
+using System;
 using System.Collections.Generic;
 using System.IO;
+using System.IO.Abstractions;
 using System.Net;
 using System.Net.Http;
 using System.Net.Http.Json;
@@ -36,6 +38,7 @@ using Moq;
 using MySqlConnector;
 using Npgsql;
 using ZiggyCreatures.Caching.Fusion;
+using static Azure.DataApiBuilder.Core.AuthenticationHelpers.AppServiceAuthentication;
 
 namespace Azure.DataApiBuilder.Service.Tests.SqlTests
 {
@@ -84,6 +87,7 @@ namespace Azure.DataApiBuilder.Service.Tests.SqlTests
             bool isRestBodyStrict = true)
         {
             TestHelper.SetupDatabaseEnvironment(DatabaseEngine);
+
             // Get the base config file from disk
             RuntimeConfig runtimeConfig = SqlTestHelper.SetupRuntimeConfig();
 
@@ -276,6 +280,10 @@ namespace Azure.DataApiBuilder.Service.Tests.SqlTests
             _queryManagerFactory = new Mock<IAbstractQueryManagerFactory>();
             Mock<IHttpContextAccessor> httpContextAccessor = new();
             string dataSourceName = runtimeConfigProvider.GetConfig().DefaultDataSourceName;
+            IFileSystem fileSystem = new FileSystem();
+            Mock<ILogger<RuntimeConfigValidator>> loggerValidator = new();
+            RuntimeConfigValidator runtimeConfigValidator = new(runtimeConfigProvider, fileSystem, loggerValidator.Object);
+
             switch (DatabaseEngine)
             {
                 case TestCategory.POSTGRESQL:
@@ -294,6 +302,7 @@ namespace Azure.DataApiBuilder.Service.Tests.SqlTests
                     _sqlMetadataProvider =
                         new PostgreSqlMetadataProvider(
                             runtimeConfigProvider,
+                            runtimeConfigValidator,
                             _queryManagerFactory.Object,
                             _sqlMetadataLogger,
                             dataSourceName);
@@ -314,6 +323,7 @@ namespace Azure.DataApiBuilder.Service.Tests.SqlTests
                     _sqlMetadataProvider =
                         new MsSqlMetadataProvider(
                             runtimeConfigProvider,
+                            runtimeConfigValidator,
                             _queryManagerFactory.Object,
                             _sqlMetadataLogger,
                             dataSourceName);
@@ -334,6 +344,7 @@ namespace Azure.DataApiBuilder.Service.Tests.SqlTests
                     _sqlMetadataProvider =
                          new MySqlMetadataProvider(
                              runtimeConfigProvider,
+                             runtimeConfigValidator,
                              _queryManagerFactory.Object,
                              _sqlMetadataLogger,
                              dataSourceName);
@@ -354,6 +365,7 @@ namespace Azure.DataApiBuilder.Service.Tests.SqlTests
                     _sqlMetadataProvider =
                          new MsSqlMetadataProvider(
                              runtimeConfigProvider,
+                             runtimeConfigValidator,
                              _queryManagerFactory.Object,
                              _sqlMetadataLogger,
                              dataSourceName);
@@ -508,9 +520,37 @@ namespace Azure.DataApiBuilder.Service.Tests.SqlTests
 
             if (clientRoleHeader is not null)
             {
-                request.Headers.Add(AuthorizationResolver.CLIENT_ROLE_HEADER, clientRoleHeader.ToString());
-                request.Headers.Add(AuthenticationOptions.CLIENT_PRINCIPAL_HEADER,
-                    AuthTestHelper.CreateStaticWebAppsEasyAuthToken(addAuthenticated: true, specificRole: clientRoleHeader));
+                request.Headers.Add(AuthorizationResolver.CLIENT_ROLE_HEADER, clientRoleHeader);
+
+                // Detect runtime auth provider once per call
+                RuntimeConfigProvider configProvider = _application.Services.GetRequiredService<RuntimeConfigProvider>();
+                string provider = configProvider.GetConfig().Runtime.Host.Authentication.Provider;
+
+                if (string.Equals(provider, nameof(EasyAuthType.AppService), StringComparison.OrdinalIgnoreCase))
+                {
+                    // AppService EasyAuth principal with this role
+                    request.Headers.Add(
+                        AuthenticationOptions.CLIENT_PRINCIPAL_HEADER,
+                        AuthTestHelper.CreateAppServiceEasyAuthToken(
+                            roleClaimType: AuthenticationOptions.ROLE_CLAIM_TYPE,
+                            additionalClaims:
+                            [
+                                new AppServiceClaim
+                                {
+                                    Typ = AuthenticationOptions.ROLE_CLAIM_TYPE,
+                                    Val = clientRoleHeader
+                                }
+                            ]));
+                }
+                else
+                {
+                    // Static Web Apps principal as before
+                    request.Headers.Add(
+                        AuthenticationOptions.CLIENT_PRINCIPAL_HEADER,
+                        AuthTestHelper.CreateStaticWebAppsEasyAuthToken(
+                            addAuthenticated: true,
+                            specificRole: clientRoleHeader));
+                }
             }
 
             // Send request to the engine.
@@ -614,13 +654,43 @@ namespace Azure.DataApiBuilder.Service.Tests.SqlTests
             bool expectsError = false)
         {
             RuntimeConfigProvider configProvider = _application.Services.GetService<RuntimeConfigProvider>();
+
+            string authToken = null;
+
+            if (isAuthenticated)
+            {
+                string provider = configProvider.GetConfig().Runtime.Host.Authentication.Provider;
+
+                if (string.Equals(provider, nameof(EasyAuthType.AppService), StringComparison.OrdinalIgnoreCase))
+                {
+                    authToken = AuthTestHelper.CreateAppServiceEasyAuthToken(
+                        roleClaimType: AuthenticationOptions.ROLE_CLAIM_TYPE,
+                        additionalClaims: !string.IsNullOrEmpty(clientRoleHeader)
+                            ?
+                            [
+                                new AppServiceClaim
+                                {
+                                    Typ = AuthenticationOptions.ROLE_CLAIM_TYPE,
+                                    Val = clientRoleHeader
+                                }
+                            ]
+                            : null);
+                }
+                else
+                {
+                    authToken = AuthTestHelper.CreateStaticWebAppsEasyAuthToken(
+                        addAuthenticated: true,
+                        specificRole: clientRoleHeader);
+                }
+            }
+
             return await GraphQLRequestExecutor.PostGraphQLRequestAsync(
                 HttpClient,
                 configProvider,
                 queryName,
                 query,
                 variables,
-                isAuthenticated ? AuthTestHelper.CreateStaticWebAppsEasyAuthToken(specificRole: clientRoleHeader) : null,
+                authToken,
                 clientRoleHeader: clientRoleHeader);
         }
 

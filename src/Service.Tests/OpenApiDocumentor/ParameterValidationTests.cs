@@ -117,8 +117,13 @@ public class ParameterValidationTests
         OpenApiPathItem pathWithouId = openApiDocument.Paths[$"/{entityName}"];
         Assert.IsTrue(pathWithouId.Operations.ContainsKey(OperationType.Post));
         Assert.IsFalse(pathWithouId.Operations[OperationType.Post].Parameters.Any(param => param.In is ParameterLocation.Query));
-        Assert.IsFalse(pathWithouId.Operations.ContainsKey(OperationType.Put));
-        Assert.IsFalse(pathWithouId.Operations.ContainsKey(OperationType.Patch));
+
+        // With keyless PUT/PATCH support, PUT and PATCH operations are present on the base path
+        // for entities with auto-generated primary keys. Validate they don't have query parameters.
+        Assert.IsTrue(pathWithouId.Operations.ContainsKey(OperationType.Put));
+        Assert.IsFalse(pathWithouId.Operations[OperationType.Put].Parameters.Any(param => param.In is ParameterLocation.Query));
+        Assert.IsTrue(pathWithouId.Operations.ContainsKey(OperationType.Patch));
+        Assert.IsFalse(pathWithouId.Operations[OperationType.Patch].Parameters.Any(param => param.In is ParameterLocation.Query));
         Assert.IsFalse(pathWithouId.Operations.ContainsKey(OperationType.Delete));
 
         // Assert that Query Parameters Excluded From NonReadOperations for path with id.
@@ -177,7 +182,7 @@ public class ParameterValidationTests
         Assert.IsTrue(operation.Parameters.Any(param =>
             param.In is ParameterLocation.Query
             && param.Name.Equals("id")
-            && param.Schema.Type.Equals("number")
+            && param.Schema.Type.Equals("integer")
             && param.Required is false));
 
         // Parameter with default value will be an optional query parameter.

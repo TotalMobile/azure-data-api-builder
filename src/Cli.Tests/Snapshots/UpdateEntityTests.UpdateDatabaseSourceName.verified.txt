@@ -18,7 +18,7 @@
         AllowCredentials: false
       },
       Authentication: {
-        Provider: StaticWebApps
+        Provider: Unauthenticated
       }
     }
   },
@@ -31,17 +31,14 @@
           Parameters: [
             {
               Name: param1,
-              Required: false,
               Default: 123
             },
             {
               Name: param2,
-              Required: false,
               Default: hello
             },
             {
               Name: param3,
-              Required: false,
               Default: True
             }
           ]

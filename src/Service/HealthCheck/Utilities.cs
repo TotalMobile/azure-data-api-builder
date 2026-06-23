@@ -1,9 +1,15 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
+using System;
 using System.Collections.Generic;
+using System.Data.Common;
 using System.Text.Json;
 using Azure.DataApiBuilder.Config.ObjectModel;
+using Microsoft.Data.SqlClient;
+using Microsoft.Extensions.Logging;
+using MySqlConnector;
+using Npgsql;
 
 namespace Azure.DataApiBuilder.Service.HealthCheck
 {
@@ -32,6 +38,20 @@ namespace Azure.DataApiBuilder.Service.HealthCheck
             }
         }
 
+        public static DbProviderFactory GetDbProviderFactory(DatabaseType dbType)
+        {
+            switch (dbType)
+            {
+                case DatabaseType.PostgreSQL:
+                    return NpgsqlFactory.Instance;
+                case DatabaseType.MSSQL:
+                case DatabaseType.DWSQL:
+                    return SqlClientFactory.Instance;
+                default:
+                    throw new NotSupportedException($"Database type '{dbType}' is not supported.");
+            }
+        }
+
         public static string CreateHttpGraphQLQuery(string entityName, List<string> columnNames, int first)
         {
             var payload = new
@@ -50,6 +70,33 @@ namespace Azure.DataApiBuilder.Service.HealthCheck
             // Create the payload for the REST HTTP request.
             // "EntityName?$first=4"
             return $"/{entityName}?$first={first}";
+        }
+
+        public static string NormalizeConnectionString(string connectionString, DatabaseType dbType, ILogger? logger = null)
+        {
+            try
+            {
+                switch (dbType)
+                {
+                    case DatabaseType.PostgreSQL:
+                        return new NpgsqlConnectionStringBuilder(connectionString).ToString();
+                    case DatabaseType.MySQL:
+                        return new MySqlConnectionStringBuilder(connectionString).ToString();
+                    case DatabaseType.MSSQL:
+                    case DatabaseType.DWSQL:
+                        return new SqlConnectionStringBuilder(connectionString).ToString();
+                    default:
+                        return connectionString;
+                }
+            }
+            catch (Exception ex)
+            {
+                // Log the exception if a logger is provided
+                logger?.LogWarning(ex, "Failed to parse connection string for database type {DatabaseType}. Returning original connection string.", dbType);
+                // If the connection string cannot be parsed by the builder,
+                // return the original string to avoid failing the health check.
+                return connectionString;
+            }
         }
     }
 }

@@ -161,7 +161,7 @@ namespace Azure.DataApiBuilder.Service.Controllers
         {
             return await HandleOperation(
                 route,
-                DeterminePatchPutSemantics(EntityActionOperation.Upsert));
+                EntityActionOperation.Upsert);
         }
 
         /// <summary>
@@ -181,7 +181,7 @@ namespace Azure.DataApiBuilder.Service.Controllers
         {
             return await HandleOperation(
                 route,
-                DeterminePatchPutSemantics(EntityActionOperation.UpsertIncremental));
+                EntityActionOperation.UpsertIncremental);
         }
 
         /// <summary>
@@ -206,6 +206,11 @@ namespace Azure.DataApiBuilder.Service.Controllers
             {
                 TelemetryMetricsHelper.IncrementActiveRequests(ApiType.REST);
 
+                if (operationType is EntityActionOperation.Upsert or EntityActionOperation.UpsertIncremental)
+                {
+                    operationType = DeterminePatchPutSemantics(operationType);
+                }
+
                 if (activity is not null)
                 {
                     activity.TrackMainControllerActivityStarted(
@@ -222,6 +227,7 @@ namespace Azure.DataApiBuilder.Service.Controllers
                 string routeAfterPathBase = _restService.GetRouteAfterPathBase(route);
 
                 // Explicitly handle OpenAPI description document retrieval requests.
+                // Supports /openapi (superset of all roles) and /openapi/{role} (role-specific)
                 if (string.Equals(routeAfterPathBase, OpenApiDocumentor.OPENAPI_ROUTE, StringComparison.OrdinalIgnoreCase))
                 {
                     if (_openApiDocumentor.TryGetDocument(out string? document))
@@ -230,6 +236,39 @@ namespace Azure.DataApiBuilder.Service.Controllers
                     }
 
                     return NotFound();
+                }
+
+                // Handle /openapi/{role} route for role-specific OpenAPI documents
+                // Only allow in Development mode for security reasons
+                if (routeAfterPathBase.StartsWith(OpenApiDocumentor.OPENAPI_ROUTE + "/", StringComparison.OrdinalIgnoreCase))
+                {
+                    RuntimeConfig config = _runtimeConfigProvider.GetConfig();
+                    if (config.Runtime?.Host?.Mode != HostMode.Development)
+                    {
+                        return NotFound();
+                    }
+
+                    string role = Uri.UnescapeDataString(
+                        routeAfterPathBase.Substring(OpenApiDocumentor.OPENAPI_ROUTE.Length + 1));
+
+                    // Validate role doesn't contain path separators (reject /openapi/foo/bar)
+                    if (string.IsNullOrEmpty(role) || role.Contains('/'))
+                    {
+                        return Problem(
+                            detail: $"Invalid role name '{role}'. Role names must not be empty or contain path separators.",
+                            statusCode: StatusCodes.Status404NotFound,
+                            title: "Not Found");
+                    }
+
+                    if (_openApiDocumentor.TryGetDocumentForRole(role, out string? roleDocument))
+                    {
+                        return Content(roleDocument, MediaTypeNames.Application.Json);
+                    }
+
+                    return Problem(
+                        detail: $"Role '{role}' is not present in the configuration.",
+                        statusCode: StatusCodes.Status404NotFound,
+                        title: "Not Found");
                 }
 
                 (string entityName, string primaryKeyRoute) = _restService.GetEntityNameAndPrimaryKeyRouteFromRoute(routeAfterPathBase);

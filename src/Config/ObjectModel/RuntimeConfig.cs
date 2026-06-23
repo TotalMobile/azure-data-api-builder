@@ -6,6 +6,7 @@ using System.IO.Abstractions;
 using System.Net;
 using System.Text.Json;
 using System.Text.Json.Serialization;
+using Azure.DataApiBuilder.Config.Converters;
 using Azure.DataApiBuilder.Service.Exceptions;
 using Microsoft.Extensions.Logging;
 
@@ -18,16 +19,46 @@ public record RuntimeConfig
 
     public const string DEFAULT_CONFIG_SCHEMA_LINK = "https://github.com/Azure/data-api-builder/releases/download/vmajor.minor.patch/dab.draft.schema.json";
 
-    public DataSource DataSource { get; init; }
+    public DataSource? DataSource { get; init; }
 
     public RuntimeOptions? Runtime { get; init; }
 
     [JsonPropertyName("azure-key-vault")]
     public AzureKeyVaultOptions? AzureKeyVault { get; init; }
 
+    public RuntimeAutoentities Autoentities { get; init; }
+
     public virtual RuntimeEntities Entities { get; init; }
 
     public DataSourceFiles? DataSourceFiles { get; init; }
+
+    /// <summary>
+    /// Indicates whether this config was loaded as a child via another config's data-source-files.
+    /// </summary>
+    [JsonIgnore]
+    public bool IsChildConfig { get; set; }
+
+    /// <summary>
+    /// Indicates whether this is the root config — the top-level config that has child data-source-files.
+    /// A child config that itself has data-source-files is NOT a root; only the top-level config is.
+    /// </summary>
+    [JsonIgnore]
+    public bool IsRootConfig => DataSourceFiles?.SourceFiles?.Any() == true && !IsChildConfig;
+
+    /// <summary>
+    /// Tracks how many entities each autoentity definition resolved during metadata initialization.
+    /// Populated during autoentity expansion in metadata providers.
+    /// </summary>
+    [JsonIgnore]
+    public Dictionary<string, int> AutoentityResolutionCounts { get; } = new();
+
+    /// <summary>
+    /// Child configs loaded via data-source-files, stored with their filenames.
+    /// Retained for per-child validation after merge. These are the original child configs
+    /// before their entities were merged into the parent.
+    /// </summary>
+    [JsonIgnore]
+    public List<(string FileName, RuntimeConfig Config)> ChildConfigs { get; } = new();
 
     [JsonIgnore(Condition = JsonIgnoreCondition.Always)]
     public bool CosmosDataSourceUsed { get; private set; }
@@ -70,7 +101,7 @@ public record RuntimeConfig
         (Runtime is null ||
          Runtime.Rest is null ||
          Runtime.Rest.Enabled) &&
-         DataSource.DatabaseType != DatabaseType.CosmosDB_NoSQL;
+         DataSource?.DatabaseType != DatabaseType.CosmosDB_NoSQL;
 
     /// <summary>
     /// Retrieves the value of runtime.mcp.enabled property if present, default is true.
@@ -93,10 +124,28 @@ public record RuntimeConfig
     /// <returns>True if the authentication provider is enabled for Static Web Apps, otherwise false.</returns>
     [JsonIgnore]
     public bool IsStaticWebAppsIdentityProvider =>
+        Runtime?.Host?.Authentication is not null &&
+        EasyAuthType.StaticWebApps.ToString().Equals(Runtime.Host.Authentication.Provider, StringComparison.OrdinalIgnoreCase);
+
+    /// <summary>
+    /// A shorthand method to determine whether App Service is configured for the current authentication provider.
+    /// </summary>
+    /// <returns>True if the authentication provider is enabled for App Service, otherwise false.</returns>
+    [JsonIgnore]
+    public bool IsAppServiceIdentityProvider =>
+        Runtime?.Host?.Authentication is not null &&
+        EasyAuthType.AppService.ToString().Equals(Runtime.Host.Authentication.Provider, StringComparison.OrdinalIgnoreCase);
+
+    /// <summary>
+    /// A shorthand method to determine whether Unauthenticated is configured for the current authentication provider.
+    /// </summary>
+    /// <returns>True if the authentication provider is Unauthenticated (the default), otherwise false.</returns>
+    [JsonIgnore]
+    public bool IsUnauthenticatedIdentityProvider =>
         Runtime is null ||
         Runtime.Host is null ||
         Runtime.Host.Authentication is null ||
-        EasyAuthType.StaticWebApps.ToString().Equals(Runtime.Host.Authentication.Provider, StringComparison.OrdinalIgnoreCase);
+        AuthenticationOptions.UNAUTHENTICATED_AUTHENTICATION.Equals(Runtime.Host.Authentication.Provider, StringComparison.OrdinalIgnoreCase);
 
     /// <summary>
     /// The path at which Rest APIs are available
@@ -203,6 +252,8 @@ public record RuntimeConfig
 
     private Dictionary<string, string> _entityNameToDataSourceName = new();
 
+    private Dictionary<string, string> _autoentityNameToDataSourceName = new();
+
     private Dictionary<string, string> _entityPathNameToEntityName = new();
 
     /// <summary>
@@ -232,20 +283,41 @@ public record RuntimeConfig
         return _entityPathNameToEntityName.TryGetValue(entityPathName, out entityName);
     }
 
+    public bool TryAddEntityNameToDataSourceName(string entityName)
+    {
+        return _entityNameToDataSourceName.TryAdd(entityName, this.DefaultDataSourceName);
+    }
+
+    public bool TryAddGeneratedAutoentityNameToDataSourceName(string entityName, string autoEntityDefinition)
+    {
+        if (_autoentityNameToDataSourceName.TryGetValue(autoEntityDefinition, out string? dataSourceName))
+        {
+            return _entityNameToDataSourceName.TryAdd(entityName, dataSourceName);
+        }
+
+        return false;
+    }
+
+    public bool RemoveGeneratedAutoentityNameFromDataSourceName(string entityName)
+    {
+        return _entityNameToDataSourceName.Remove(entityName);
+    }
+
     /// <summary>
     /// Constructor for runtimeConfig.
     /// To be used when setting up from cli json scenario.
     /// </summary>
     /// <param name="Schema">schema for config.</param>
-    /// <param name="DataSource">Default datasource.</param>
+    /// <param name="DataSource">Default datasource. May be null for root configs that use <paramref name="DataSourceFiles"/> and delegate the data source to child configs.</param>
     /// <param name="Entities">Entities</param>
     /// <param name="Runtime">Runtime settings.</param>
     /// <param name="DataSourceFiles">List of datasource files for multiple db scenario. Null for single db scenario.</param>
     [JsonConstructor]
     public RuntimeConfig(
         string? Schema,
-        DataSource DataSource,
+        DataSource? DataSource,
         RuntimeEntities Entities,
+        RuntimeAutoentities? Autoentities = null,
         RuntimeOptions? Runtime = null,
         DataSourceFiles? DataSourceFiles = null,
         AzureKeyVaultOptions? AzureKeyVault = null)
@@ -254,35 +326,39 @@ public record RuntimeConfig
         this.DataSource = DataSource;
         this.Runtime = Runtime;
         this.AzureKeyVault = AzureKeyVault;
-        this.Entities = Entities;
+        this.Entities = Entities ?? new RuntimeEntities(new Dictionary<string, Entity>());
+        this.Autoentities = Autoentities ?? new RuntimeAutoentities(new Dictionary<string, Autoentity>());
         this.DefaultDataSourceName = Guid.NewGuid().ToString();
 
-        if (this.DataSource is null)
+        // Set up datasource mapping only when a data source is provided.
+        // Root configs (with data-source-files) may omit the data source.
+        _dataSourceNameToDataSource = new Dictionary<string, DataSource>();
+        if (this.DataSource is not null)
         {
-            throw new DataApiBuilderException(
-                message: "data-source is a mandatory property in DAB Config",
-                statusCode: HttpStatusCode.UnprocessableEntity,
-                subStatusCode: DataApiBuilderException.SubStatusCodes.ConfigValidationError);
+            _dataSourceNameToDataSource.Add(this.DefaultDataSourceName, this.DataSource);
         }
-
-        // we will set them up with default values
-        _dataSourceNameToDataSource = new Dictionary<string, DataSource>
-        {
-            { this.DefaultDataSourceName, this.DataSource }
-        };
 
         _entityNameToDataSourceName = new Dictionary<string, string>();
-        if (Entities is null)
-        {
-            throw new DataApiBuilderException(
-                message: "entities is a mandatory property in DAB Config",
-                statusCode: HttpStatusCode.UnprocessableEntity,
-                subStatusCode: DataApiBuilderException.SubStatusCodes.ConfigValidationError);
-        }
 
-        foreach (KeyValuePair<string, Entity> entity in Entities)
+        // Map entities and autoentities to the default datasource when a datasource is available.
+        // Without a datasource, entity/autoentity mappings are not created since they cannot be resolved.
+        if (this.DataSource is not null)
         {
-            _entityNameToDataSourceName.TryAdd(entity.Key, this.DefaultDataSourceName);
+            if (Entities is not null)
+            {
+                foreach (KeyValuePair<string, Entity> entity in Entities)
+                {
+                    _entityNameToDataSourceName.TryAdd(entity.Key, this.DefaultDataSourceName);
+                }
+            }
+
+            if (Autoentities is not null)
+            {
+                foreach (KeyValuePair<string, Autoentity> autoentity in Autoentities)
+                {
+                    _autoentityNameToDataSourceName.TryAdd(autoentity.Key, this.DefaultDataSourceName);
+                }
+            }
         }
 
         // Process data source and entities information for each database in multiple database scenario.
@@ -290,7 +366,8 @@ public record RuntimeConfig
 
         if (DataSourceFiles is not null && DataSourceFiles.SourceFiles is not null)
         {
-            IEnumerable<KeyValuePair<string, Entity>> allEntities = Entities.AsEnumerable();
+            IEnumerable<KeyValuePair<string, Entity>>? allEntities = Entities?.AsEnumerable();
+            IEnumerable<KeyValuePair<string, Autoentity>>? allAutoentities = Autoentities?.AsEnumerable();
             // Iterate through all the datasource files and load the config.
             IFileSystem fileSystem = new FileSystem();
             // This loader is not used as a part of hot reload and therefore does not need a handler.
@@ -298,13 +375,25 @@ public record RuntimeConfig
 
             foreach (string dataSourceFile in DataSourceFiles.SourceFiles)
             {
-                if (loader.TryLoadConfig(dataSourceFile, out RuntimeConfig? config, replaceEnvVar: true))
+                // Use Ignore mode so missing env vars are left as literal @env() strings,
+                // consistent with how the parent config is loaded in TryLoadKnownConfig.
+                DeserializationVariableReplacementSettings replacementSettings = new(azureKeyVaultOptions: null, doReplaceEnvVar: true, doReplaceAkvVar: true, envFailureMode: EnvironmentVariableReplacementFailureMode.Ignore);
+
+                if (loader.TryLoadConfig(dataSourceFile, out RuntimeConfig? config, replacementSettings: replacementSettings))
                 {
                     try
                     {
+                        // Mark the child so it's not treated as a root during validation.
+                        config.IsChildConfig = true;
+
+                        // Store the child config reference for per-child validation.
+                        ChildConfigs.Add((dataSourceFile, config));
+
                         _dataSourceNameToDataSource = _dataSourceNameToDataSource.Concat(config._dataSourceNameToDataSource).ToDictionary(kvp => kvp.Key, kvp => kvp.Value);
                         _entityNameToDataSourceName = _entityNameToDataSourceName.Concat(config._entityNameToDataSourceName).ToDictionary(kvp => kvp.Key, kvp => kvp.Value);
-                        allEntities = allEntities.Concat(config.Entities.AsEnumerable());
+                        _autoentityNameToDataSourceName = _autoentityNameToDataSourceName.Concat(config._autoentityNameToDataSourceName).ToDictionary(kvp => kvp.Key, kvp => kvp.Value);
+                        allEntities = allEntities?.Concat(config.Entities.AsEnumerable());
+                        allAutoentities = allAutoentities?.Concat(config.Autoentities.AsEnumerable());
                     }
                     catch (Exception e)
                     {
@@ -316,13 +405,24 @@ public record RuntimeConfig
                             e.InnerException);
                     }
                 }
+                else if (fileSystem.File.Exists(dataSourceFile))
+                {
+                    // The file exists but failed to load (e.g. invalid JSON, deserialization error).
+                    // Throw to prevent silently skipping a broken child config.
+                    // Non-existent files are skipped gracefully to support late-configured scenarios
+                    // where data-source-files may reference files not present on the host.
+                    throw new DataApiBuilderException(
+                        message: $"Failed to load datasource file: {dataSourceFile}. Ensure the file is accessible and contains a valid DAB configuration.",
+                        statusCode: HttpStatusCode.ServiceUnavailable,
+                        subStatusCode: DataApiBuilderException.SubStatusCodes.ConfigValidationError);
+                }
             }
 
-            this.Entities = new RuntimeEntities(allEntities.ToDictionary(x => x.Key, x => x.Value));
+            this.Entities = new RuntimeEntities(allEntities != null ? allEntities.ToDictionary(x => x.Key, x => x.Value) : new Dictionary<string, Entity>());
+            this.Autoentities = new RuntimeAutoentities(allAutoentities != null ? allAutoentities.ToDictionary(x => x.Key, x => x.Value) : new Dictionary<string, Autoentity>());
         }
 
         SetupDataSourcesUsed();
-
     }
 
     /// <summary>
@@ -333,17 +433,19 @@ public record RuntimeConfig
     /// <param name="DataSource">Default datasource.</param>
     /// <param name="Runtime">Runtime settings.</param>
     /// <param name="Entities">Entities</param>
+    /// <param name="Autoentities">Autoentities</param>
     /// <param name="DataSourceFiles">List of datasource files for multiple db scenario.Null for single db scenario.
     /// <param name="DefaultDataSourceName">DefaultDataSourceName to maintain backward compatibility.</param>
     /// <param name="DataSourceNameToDataSource">Dictionary mapping datasourceName to datasource object.</param>
     /// <param name="EntityNameToDataSourceName">Dictionary mapping entityName to datasourceName.</param>
     /// <param name="DataSourceFiles">Datasource files which represent list of child runtimeconfigs for multi-db scenario.</param>
-    public RuntimeConfig(string Schema, DataSource DataSource, RuntimeOptions Runtime, RuntimeEntities Entities, string DefaultDataSourceName, Dictionary<string, DataSource> DataSourceNameToDataSource, Dictionary<string, string> EntityNameToDataSourceName, DataSourceFiles? DataSourceFiles = null, AzureKeyVaultOptions? AzureKeyVault = null)
+    public RuntimeConfig(string Schema, DataSource DataSource, RuntimeOptions Runtime, RuntimeEntities Entities, string DefaultDataSourceName, Dictionary<string, DataSource> DataSourceNameToDataSource, Dictionary<string, string> EntityNameToDataSourceName, DataSourceFiles? DataSourceFiles = null, AzureKeyVaultOptions? AzureKeyVault = null, RuntimeAutoentities? Autoentities = null)
     {
         this.Schema = Schema;
         this.DataSource = DataSource;
         this.Runtime = Runtime;
         this.Entities = Entities;
+        this.Autoentities = Autoentities ?? new RuntimeAutoentities(new Dictionary<string, Autoentity>());
         this.DefaultDataSourceName = DefaultDataSourceName;
         _dataSourceNameToDataSource = DataSourceNameToDataSource;
         _entityNameToDataSourceName = EntityNameToDataSourceName;
@@ -392,7 +494,7 @@ public record RuntimeConfig
     public void UpdateDefaultDataSourceName(string initialDefaultDataSourceName)
     {
         _dataSourceNameToDataSource.Remove(DefaultDataSourceName);
-        if (!_dataSourceNameToDataSource.TryAdd(initialDefaultDataSourceName, this.DataSource))
+        if (!_dataSourceNameToDataSource.TryAdd(initialDefaultDataSourceName, this.DataSource!))
         {
             // An exception here means that a default data source name was generated as a GUID that
             // matches the original default data source name. This should never happen but we add this
@@ -434,6 +536,24 @@ public record RuntimeConfig
     }
 
     /// <summary>
+    /// Gets datasourceName from AutoentityNameToDatasourceName dictionary.
+    /// </summary>
+    /// <param name="autoentityName">autoentityName</param>
+    /// <returns>DataSourceName</returns>
+    public string GetDataSourceNameFromAutoentityName(string autoentityName)
+    {
+        if (!_autoentityNameToDataSourceName.TryGetValue(autoentityName, out string? autoentityDataSource))
+        {
+            throw new DataApiBuilderException(
+                message: $"'{autoentityName}' is not a valid autoentities definition.",
+                statusCode: HttpStatusCode.NotFound,
+                subStatusCode: DataApiBuilderException.SubStatusCodes.EntityNotFound);
+        }
+
+        return autoentityDataSource;
+    }
+
+    /// <summary>
     /// Validates if datasource is present in runtimeConfig.
     /// </summary>
     public bool CheckDataSourceExists(string dataSourceName)
@@ -448,7 +568,7 @@ public record RuntimeConfig
     public string ToJson(JsonSerializerOptions? jsonSerializerOptions = null)
     {
         // get default serializer options if none provided.
-        jsonSerializerOptions = jsonSerializerOptions ?? RuntimeConfigLoader.GetSerializationOptions();
+        jsonSerializerOptions = jsonSerializerOptions ?? RuntimeConfigLoader.GetSerializationOptions(replacementSettings: null);
         return JsonSerializer.Serialize(this, jsonSerializerOptions);
     }
 
@@ -458,12 +578,13 @@ public record RuntimeConfig
 
     /// <summary>
     /// Returns the ttl-seconds value for a given entity.
-    /// If the property is not set, returns the global default value set in the runtime config.
-    /// If the global default value is not set, the default value is used (5 seconds).
+    /// If the entity explicitly sets ttl-seconds, that value is used.
+    /// Otherwise, falls back to the global cache TTL setting.
+    /// Callers are responsible for checking whether caching is enabled before using the result.
     /// </summary>
     /// <param name="entityName">Name of the entity to check cache configuration.</param>
     /// <returns>Number of seconds (ttl) that a cache entry should be valid before cache eviction.</returns>
-    /// <exception cref="DataApiBuilderException">Raised when an invalid entity name is provided or if the entity has caching disabled.</exception>
+    /// <exception cref="DataApiBuilderException">Raised when an invalid entity name is provided.</exception>
     public virtual int GetEntityCacheEntryTtl(string entityName)
     {
         if (!Entities.TryGetValue(entityName, out Entity? entityConfig))
@@ -474,31 +595,23 @@ public record RuntimeConfig
                 subStatusCode: DataApiBuilderException.SubStatusCodes.EntityNotFound);
         }
 
-        if (!entityConfig.IsCachingEnabled)
-        {
-            throw new DataApiBuilderException(
-                message: $"{entityName} does not have caching enabled.",
-                statusCode: HttpStatusCode.BadRequest,
-                subStatusCode: DataApiBuilderException.SubStatusCodes.NotSupported);
-        }
-
-        if (entityConfig.Cache.UserProvidedTtlOptions)
+        if (entityConfig.Cache is not null && entityConfig.Cache.UserProvidedTtlOptions)
         {
             return entityConfig.Cache.TtlSeconds.Value;
         }
-        else
-        {
-            return GlobalCacheEntryTtl();
-        }
+
+        return GlobalCacheEntryTtl();
     }
 
     /// <summary>
     /// Returns the cache level value for a given entity.
-    /// If the property is not set, returns the default (L1L2) for a given entity.
+    /// If the entity explicitly sets level, that value is used.
+    /// Otherwise, falls back to the global cache level or the default.
+    /// Callers are responsible for checking whether caching is enabled before using the result.
     /// </summary>
     /// <param name="entityName">Name of the entity to check cache configuration.</param>
     /// <returns>Cache level that a cache entry should be stored in.</returns>
-    /// <exception cref="DataApiBuilderException">Raised when an invalid entity name is provided or if the entity has caching disabled.</exception>
+    /// <exception cref="DataApiBuilderException">Raised when an invalid entity name is provided.</exception>
     public virtual EntityCacheLevel GetEntityCacheEntryLevel(string entityName)
     {
         if (!Entities.TryGetValue(entityName, out Entity? entityConfig))
@@ -509,22 +622,38 @@ public record RuntimeConfig
                 subStatusCode: DataApiBuilderException.SubStatusCodes.EntityNotFound);
         }
 
-        if (!entityConfig.IsCachingEnabled)
-        {
-            throw new DataApiBuilderException(
-                message: $"{entityName} does not have caching enabled.",
-                statusCode: HttpStatusCode.BadRequest,
-                subStatusCode: DataApiBuilderException.SubStatusCodes.NotSupported);
-        }
-
-        if (entityConfig.Cache.UserProvidedLevelOptions)
+        if (entityConfig.Cache is not null && entityConfig.Cache.UserProvidedLevelOptions)
         {
             return entityConfig.Cache.Level.Value;
         }
-        else
-        {
-            return EntityCacheLevel.L1L2;
-        }
+
+        // GlobalCacheEntryLevel() returns null when runtime cache is not configured.
+        // Default to L1 to match EntityCacheOptions.DEFAULT_LEVEL.
+        return GlobalCacheEntryLevel() ?? EntityCacheOptions.DEFAULT_LEVEL;
+    }
+
+    /// <summary>
+    /// Returns the ttl-seconds value for the global cache entry.
+    /// If no value is explicitly set, returns the global default value.
+    /// </summary>
+    /// <returns>Number of seconds a cache entry should be valid before cache eviction.</returns>
+    public virtual int GlobalCacheEntryTtl()
+    {
+        return Runtime is not null && Runtime.IsCachingEnabled && Runtime.Cache.UserProvidedTtlOptions
+            ? Runtime.Cache.TtlSeconds.Value
+            : EntityCacheOptions.DEFAULT_TTL_SECONDS;
+    }
+
+    /// <summary>
+    /// Returns the cache level value for the global cache entry.
+    /// The level is inferred from the runtime cache Level2 configuration:
+    /// if Level2 is enabled, the level is L1L2; otherwise L1.
+    /// Returns null when runtime cache is not configured.
+    /// </summary>
+    /// <returns>Cache level for a cache entry, or null if runtime cache is not configured.</returns>
+    public virtual EntityCacheLevel? GlobalCacheEntryLevel()
+    {
+        return Runtime?.Cache?.InferredLevel;
     }
 
     /// <summary>
@@ -535,20 +664,8 @@ public record RuntimeConfig
     /// <returns>Whether cache operations should proceed.</returns>
     public virtual bool CanUseCache()
     {
-        bool setSessionContextEnabled = DataSource.GetTypedOptions<MsSqlOptions>()?.SetSessionContext ?? true;
+        bool setSessionContextEnabled = DataSource?.GetTypedOptions<MsSqlOptions>()?.SetSessionContext ?? true;
         return IsCachingEnabled && !setSessionContextEnabled;
-    }
-
-    /// <summary>
-    /// Returns the ttl-seconds value for the global cache entry.
-    /// If no value is explicitly set, returns the global default value.
-    /// </summary>
-    /// <returns>Number of seconds a cache entry should be valid before cache eviction.</returns>
-    public int GlobalCacheEntryTtl()
-    {
-        return Runtime is not null && Runtime.IsCachingEnabled && Runtime.Cache.UserProvidedTtlOptions
-            ? Runtime.Cache.TtlSeconds.Value
-            : EntityCacheOptions.DEFAULT_TTL_SECONDS;
     }
 
     private void CheckDataSourceNamePresent(string dataSourceName)
@@ -602,7 +719,7 @@ public record RuntimeConfig
     /// </summary>
     public bool IsMultipleCreateOperationEnabled()
     {
-        return Enum.GetNames(typeof(MultipleCreateSupportingDatabaseType)).Any(x => x.Equals(DataSource.DatabaseType.ToString(), StringComparison.OrdinalIgnoreCase)) &&
+        return Enum.GetNames(typeof(MultipleCreateSupportingDatabaseType)).Any(x => x.Equals(DataSource?.DatabaseType.ToString(), StringComparison.OrdinalIgnoreCase)) &&
                (Runtime is not null &&
                Runtime.GraphQL is not null &&
                Runtime.GraphQL.MultipleMutationOptions is not null &&
@@ -692,6 +809,17 @@ public record RuntimeConfig
     }
 
     /// <summary>
+    /// Checks if config actually specifies a non-null log level value.
+    /// This is stricter than !IsLogLevelNull() because it verifies at least
+    /// one log level value is explicitly set (not null).
+    /// Used to determine if MCP logging/setLevel should be blocked.
+    /// </summary>
+    public bool HasExplicitLogLevel()
+    {
+        return Runtime?.Telemetry?.LoggerLevel?.Values.Any(v => v.HasValue) ?? false;
+    }
+
+    /// <summary>
     /// Takes in the RuntimeConfig object and checks the LogLevel.
     /// If LogLevel is not null, it will return the current value as a LogLevel,
     /// else it will take the default option by checking host mode.
@@ -700,7 +828,6 @@ public record RuntimeConfig
     /// </summary>
     public LogLevel GetConfiguredLogLevel(string loggerFilter = "")
     {
-
         if (!IsLogLevelNull())
         {
             int max = 0;
@@ -721,7 +848,8 @@ public record RuntimeConfig
                 return (LogLevel)value;
             }
 
-            Runtime!.Telemetry!.LoggerLevel!.TryGetValue("default", out value);
+            value = Runtime!.Telemetry!.LoggerLevel!
+                .SingleOrDefault(kvp => kvp.Key.Equals("default", StringComparison.OrdinalIgnoreCase)).Value;
             if (value is not null)
             {
                 return (LogLevel)value;
@@ -741,4 +869,46 @@ public record RuntimeConfig
     /// </summary>
     [JsonIgnore]
     public DmlToolsConfig? McpDmlTools => Runtime?.Mcp?.DmlTools;
+
+    /// <summary>
+    /// Determines whether caching is enabled for a given entity, resolving inheritance lazily.
+    /// If the entity explicitly sets cache enabled/disabled, that value wins.
+    /// If the entity has a cache object but did not explicitly set enabled (UserProvidedEnabledOptions is false),
+    /// the global runtime cache enabled setting is inherited.
+    /// If the entity has no cache config at all, the global runtime cache enabled setting is inherited.
+    /// </summary>
+    /// <param name="entityName">Name of the entity to check cache configuration.</param>
+    /// <returns>Whether caching is enabled for the entity.</returns>
+    /// <exception cref="DataApiBuilderException">Raised when an invalid entity name is provided.</exception>
+    public virtual bool IsEntityCachingEnabled(string entityName)
+    {
+        if (!Entities.TryGetValue(entityName, out Entity? entityConfig))
+        {
+            throw new DataApiBuilderException(
+                message: $"{entityName} is not a valid entity.",
+                statusCode: HttpStatusCode.BadRequest,
+                subStatusCode: DataApiBuilderException.SubStatusCodes.EntityNotFound);
+        }
+
+        return IsEntityCachingEnabled(entityConfig);
+    }
+
+    /// <summary>
+    /// Determines whether caching is enabled for a given entity, resolving inheritance lazily.
+    /// If the entity explicitly sets cache enabled/disabled (UserProvidedEnabledOptions is true), that value wins.
+    /// Otherwise, inherits the global runtime cache enabled setting.
+    /// </summary>
+    /// <param name="entity">The entity to check cache configuration.</param>
+    /// <returns>Whether caching is enabled for the entity.</returns>
+    private bool IsEntityCachingEnabled(Entity entity)
+    {
+        // If entity has an explicit cache config with user-provided enabled value, use it.
+        if (entity.Cache is not null && entity.Cache.UserProvidedEnabledOptions)
+        {
+            return entity.IsCachingEnabled;
+        }
+
+        // Otherwise, inherit from the global runtime cache setting.
+        return IsCachingEnabled;
+    }
 }

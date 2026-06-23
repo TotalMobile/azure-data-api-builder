@@ -2,7 +2,6 @@
 // Licensed under the MIT License.
 
 using System.Text.Json;
-using Azure.DataApiBuilder.Auth;
 using Azure.DataApiBuilder.Config.ObjectModel;
 using Azure.DataApiBuilder.Core.Authorization;
 using Azure.DataApiBuilder.Core.Configurations;
@@ -26,6 +25,8 @@ namespace Azure.DataApiBuilder.Mcp.BuiltInTools
         /// Gets the type of the tool, which is BuiltIn for this implementation.
         /// </summary>
         public ToolType ToolType { get; } = ToolType.BuiltIn;
+
+        public bool IsEnabled(RuntimeConfig config) => config.McpDmlTools?.DescribeEntities ?? true;
 
         /// <summary>
         /// Gets the metadata for the describe-entities tool, including its name, description, and input schema.
@@ -67,6 +68,7 @@ namespace Azure.DataApiBuilder.Mcp.BuiltInTools
             CancellationToken cancellationToken = default)
         {
             ILogger<DescribeEntitiesTool>? logger = serviceProvider.GetService<ILogger<DescribeEntitiesTool>>();
+            string toolName = GetToolMetadata().Name;
 
             try
             {
@@ -77,10 +79,61 @@ namespace Azure.DataApiBuilder.Mcp.BuiltInTools
 
                 if (!IsToolEnabled(runtimeConfig))
                 {
-                    return Task.FromResult(McpResponseBuilder.BuildErrorResult(
-                        "ToolDisabled",
-                        $"The {GetToolMetadata().Name} tool is disabled in the configuration.",
-                        logger));
+                    return Task.FromResult(McpErrorHelpers.ToolDisabled(GetToolMetadata().Name, logger));
+                }
+
+                // Get authorization services to determine current user's role
+                IAuthorizationResolver authResolver = serviceProvider.GetRequiredService<IAuthorizationResolver>();
+                IHttpContextAccessor httpContextAccessor = serviceProvider.GetRequiredService<IHttpContextAccessor>();
+                HttpContext? httpContext = httpContextAccessor.HttpContext;
+
+                // Get current user's role for permission filtering
+                // For discovery tools like describe_entities, we use the first valid role from the header
+                // This differs from operation-specific tools that check permissions per entity per operation
+                string? currentUserRole = null;
+                if (httpContext != null && authResolver.IsValidRoleContext(httpContext))
+                {
+                    string roleHeader = httpContext.Request.Headers[AuthorizationResolver.CLIENT_ROLE_HEADER].ToString();
+                    if (!string.IsNullOrWhiteSpace(roleHeader))
+                    {
+                        string[] roles = roleHeader
+                            .Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+
+                        if (roles.Length > 1)
+                        {
+                            logger?.LogWarning("Multiple roles detected in request header: [{Roles}]. Using first role '{FirstRole}' for entity discovery. " +
+                                "Consider using a single role for consistent permission reporting.",
+                                string.Join(", ", roles), roles[0]);
+                        }
+
+                        // For discovery operations, take the first role from comma-separated list
+                        // This provides a consistent view of available entities for the primary role
+                        currentUserRole = roles.FirstOrDefault();
+                    }
+                }
+
+                // Get current user's role for permission filtering
+                // For discovery tools like describe_entities, we use the first valid role from the header
+                // This differs from operation-specific tools that check permissions per entity per operation
+                if (httpContext != null && authResolver.IsValidRoleContext(httpContext))
+                {
+                    string roleHeader = httpContext.Request.Headers[AuthorizationResolver.CLIENT_ROLE_HEADER].ToString();
+                    if (!string.IsNullOrWhiteSpace(roleHeader))
+                    {
+                        string[] roles = roleHeader
+                            .Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+
+                        if (roles.Length > 1)
+                        {
+                            logger?.LogWarning("Multiple roles detected in request header: [{Roles}]. Using first role '{FirstRole}' for entity discovery. " +
+                                "Consider using a single role for consistent permission reporting.",
+                                string.Join(", ", roles), roles[0]);
+                        }
+
+                        // For discovery operations, take the first role from comma-separated list
+                        // This provides a consistent view of available entities for the primary role
+                        currentUserRole = roles.FirstOrDefault();
+                    }
                 }
 
                 // Get authorization services to determine current user's role
@@ -124,6 +177,10 @@ namespace Azure.DataApiBuilder.Mcp.BuiltInTools
 
                 List<Dictionary<string, object?>> entityList = new();
 
+                // Track how many entities were filtered out because DML tools are disabled (dml-tools: false).
+                // This helps provide a more specific error message when all entities are filtered.
+                int filteredDmlDisabledCount = 0;
+
                 if (runtimeConfig.Entities != null)
                 {
                     foreach (KeyValuePair<string, Entity> entityEntry in runtimeConfig.Entities)
@@ -133,38 +190,88 @@ namespace Azure.DataApiBuilder.Mcp.BuiltInTools
                         string entityName = entityEntry.Key;
                         Entity entity = entityEntry.Value;
 
+                        // Check entity filter first to avoid counting entities that wouldn't be included anyway
                         if (!ShouldIncludeEntity(entityName, entityFilter))
                         {
                             continue;
                         }
 
+                        // Filter out entities when dml-tools is explicitly disabled (false).
+                        // This applies to all entity types (tables, views, stored procedures).
+                        // When dml-tools is false, the entity is not exposed via DML tools
+                        // (read_records, create_record, etc.) and should not appear in describe_entities.
+                        if (entity.Mcp?.DmlToolEnabled == false)
+                        {
+                            filteredDmlDisabledCount++;
+                            continue;
+                        }
+
                         try
                         {
+                            DatabaseObject? databaseObject = null;
+                            if (entity.Source.Type == EntitySourceType.StoredProcedure)
+                            {
+                                databaseObject = McpMetadataHelper.TryResolveDatabaseObject(
+                                    entityName,
+                                    runtimeConfig,
+                                    serviceProvider,
+                                    out string resolveError,
+                                    cancellationToken);
+
+                                if (databaseObject is null)
+                                {
+                                    // Init normally populates DatabaseStoredProcedure for every SP entity
+                                    // (or throws and aborts startup). Reaching here means an init invariant
+                                    // regressed. Throw so the surrounding catch drops just this entity from
+                                    // the response - returning the SP with no parameter info would mislead
+                                    // the agent into thinking the SP takes no arguments.
+                                    throw new InvalidOperationException(
+                                        $"Could not resolve DB metadata for stored procedure entity '{entityName}'. Error: {resolveError}");
+                                }
+                            }
+
                             Dictionary<string, object?> entityInfo = nameOnly
                                 ? BuildBasicEntityInfo(entityName, entity)
-                                : BuildFullEntityInfo(entityName, entity, currentUserRole);
+                                : BuildFullEntityInfo(entityName, entity);
 
                             entityList.Add(entityInfo);
                         }
                         catch (Exception ex)
                         {
-                            logger?.LogWarning(ex, "Failed to build info for entity {EntityName}", entityName);
+                            logger?.LogWarning(ex, "Failed to build info for entity '{EntityName}'", entityName);
                         }
                     }
                 }
 
                 if (entityList.Count == 0)
                 {
+                    // No entities matched the filter criteria
                     if (entityFilter != null && entityFilter.Count > 0)
                     {
                         return Task.FromResult(McpResponseBuilder.BuildErrorResult(
+                            toolName,
                             "EntitiesNotFound",
                             $"No entities found matching the filter: {string.Join(", ", entityFilter)}",
                             logger));
                     }
+                    // Return a specific error when ALL configured entities have dml-tools: false.
+                    // Only show this error when every entity was intentionally filtered by the dml-tools check above,
+                    // not when some entities failed to build due to exceptions in BuildBasicEntityInfo() or BuildFullEntityInfo() functions.
+                    else if (filteredDmlDisabledCount > 0 &&
+                             runtimeConfig.Entities != null &&
+                             filteredDmlDisabledCount == runtimeConfig.Entities.Entities.Count)
+                    {
+                        return Task.FromResult(McpResponseBuilder.BuildErrorResult(
+                            toolName,
+                            "AllEntitiesFilteredDmlDisabled",
+                            $"All {filteredDmlDisabledCount} configured entities have DML tools disabled (dml-tools: false). Entities with dml-tools disabled do not appear in describe_entities. If the filtered entities are stored procedures with custom-tool enabled, check tools/list.",
+                            logger));
+                    }
+                    // Truly no entities configured in the runtime config, or entities failed to build for other reasons
                     else
                     {
                         return Task.FromResult(McpResponseBuilder.BuildErrorResult(
+                            toolName,
                             "NoEntitiesConfigured",
                             "No entities are configured in the runtime configuration.",
                             logger));
@@ -180,8 +287,14 @@ namespace Azure.DataApiBuilder.Mcp.BuiltInTools
                 Dictionary<string, object?> responseData = new()
                 {
                     ["entities"] = finalEntityList,
-                    ["count"] = finalEntityList.Count
+                    ["count"] = finalEntityList.Count,
+                    ["mode"] = nameOnly ? "basic" : "full"
                 };
+
+                if (entityFilter != null && entityFilter.Count > 0)
+                {
+                    responseData["filter"] = entityFilter.ToArray();
+                }
 
                 logger?.LogInformation(
                     "DescribeEntitiesTool returned {EntityCount} entities. Response type: {ResponseType} (nameOnly={NameOnly}).",
@@ -197,6 +310,7 @@ namespace Azure.DataApiBuilder.Mcp.BuiltInTools
             catch (OperationCanceledException)
             {
                 return Task.FromResult(McpResponseBuilder.BuildErrorResult(
+                    toolName,
                     "OperationCanceled",
                     "The describe operation was canceled.",
                     logger));
@@ -205,6 +319,7 @@ namespace Azure.DataApiBuilder.Mcp.BuiltInTools
             {
                 logger?.LogError(dabEx, "Data API Builder error in DescribeEntitiesTool");
                 return Task.FromResult(McpResponseBuilder.BuildErrorResult(
+                    toolName,
                     "DataApiBuilderError",
                     dabEx.Message,
                     logger));
@@ -212,6 +327,7 @@ namespace Azure.DataApiBuilder.Mcp.BuiltInTools
             catch (ArgumentException argEx)
             {
                 return Task.FromResult(McpResponseBuilder.BuildErrorResult(
+                    toolName,
                     "InvalidArguments",
                     argEx.Message,
                     logger));
@@ -220,6 +336,7 @@ namespace Azure.DataApiBuilder.Mcp.BuiltInTools
             {
                 logger?.LogError(ioEx, "Invalid operation in DescribeEntitiesTool");
                 return Task.FromResult(McpResponseBuilder.BuildErrorResult(
+                    toolName,
                     "InvalidOperation",
                     "Failed to retrieve entity metadata: " + ioEx.Message,
                     logger));
@@ -228,6 +345,7 @@ namespace Azure.DataApiBuilder.Mcp.BuiltInTools
             {
                 logger?.LogError(ex, "Unexpected error in DescribeEntitiesTool");
                 return Task.FromResult(McpResponseBuilder.BuildErrorResult(
+                    toolName,
                     "UnexpectedError",
                     "An unexpected error occurred while describing entities.",
                     logger));
@@ -330,13 +448,7 @@ namespace Azure.DataApiBuilder.Mcp.BuiltInTools
         /// <summary>
         /// Builds full entity info: name, description, fields, parameters (for stored procs), permissions.
         /// </summary>
-        /// <param name="entityName">The name of the entity to include in the dictionary.</param>
-        /// <param name="entity">The entity object from which to extract additional information.</param>
-        /// <param name="currentUserRole">The role of the current user, used to determine permissions.</param>
-        /// <returns>
-        /// A dictionary containing the entity's name, description, fields, parameters (if applicable), and permissions.
-        /// </returns>
-        private static Dictionary<string, object?> BuildFullEntityInfo(string entityName, Entity entity, string? currentUserRole)
+        private static Dictionary<string, object?> BuildFullEntityInfo(string entityName, Entity entity)
         {
             // Use GraphQL singular name as alias if available, otherwise use entity name
             string displayName = !string.IsNullOrWhiteSpace(entity.GraphQL?.Singular)
@@ -352,7 +464,7 @@ namespace Azure.DataApiBuilder.Mcp.BuiltInTools
 
             if (entity.Source.Type == EntitySourceType.StoredProcedure)
             {
-                info["parameters"] = BuildParameterMetadataInfo(entity.Source.Parameters);
+                info["parameters"] = BuildParameterMetadataInfo(databaseObject);
             }
 
             info["permissions"] = BuildPermissionsInfo(entity, currentUserRole);
@@ -386,10 +498,33 @@ namespace Azure.DataApiBuilder.Mcp.BuiltInTools
         }
 
         /// <summary>
-        /// Builds a list of parameter metadata objects containing information about each parameter.
+        /// Builds the parameter list for a stored procedure entity.
+        /// Each entry has: name, required, default, description.
+        ///
+        /// The per-field rules are agreed in issue #3400:
+        ///   name        - DB metadata is the source of truth; config cannot override.
+        ///   required    - defaults to true when not set in config.
+        ///                 (SQL Server's is_nullable describes the type, not whether the
+        ///                  parameter must be supplied at call time, so it is unreliable.)
+        ///   default     - config-only. T-SQL parameter defaults are not exposed as
+        ///                 structured metadata, so they cannot be discovered from the DB.
+        ///   description - config-only. SQL Server has no description column for parameters.
+        ///
+        /// The merge of config onto DB metadata is already performed upstream by
+        /// <see cref="Core.Services.MetadataProviders.SqlMetadataProvider"/> /
+        /// <see cref="Core.Services.MetadataProviders.MsSqlMetadataProvider"/> when populating
+        /// <see cref="DatabaseStoredProcedure"/>. Each <see cref="ParameterDefinition"/> therefore
+        /// already reflects the config overlay; we just project it.
+        ///
+        /// For an SP entity that successfully initialized, the metadata provider always has a
+        /// populated <see cref="DatabaseStoredProcedure"/>: init throws otherwise (e.g.
+        /// SqlMetadataProvider.FillSchemaForStoredProcedureAsync raises via HandleOrRecordException
+        /// when config declares a parameter the DB doesn't have, and startup aborts). If this
+        /// invariant ever regresses we throw rather than fabricate empty parameter info, so the
+        /// surrounding per-entity catch drops just this entity from the response.
         /// </summary>
         /// <param name="parameters">A list of <see cref="ParameterMetadata"/> objects representing the parameters to process. Can be null.</param>
-        /// <returns>A list of dictionaries, each containing the parameter's name, whether it is required, its default
+        /// <returns>A list of anonymous objects, each containing the parameter's name, whether it is required, its default
         /// value, and its description. Returns an empty list if <paramref name="parameters"/> is null.</returns>
         private static List<object> BuildParameterMetadataInfo(List<ParameterMetadata>? parameters)
         {
@@ -399,19 +534,28 @@ namespace Azure.DataApiBuilder.Mcp.BuiltInTools
             {
                 foreach (ParameterMetadata param in parameters)
                 {
-                    Dictionary<string, object?> paramInfo = new()
+                    result.Add(new
                     {
-                        ["name"] = param.Name,
-                        ["required"] = param.Required,
-                        ["default"] = param.Default,
-                        ["description"] = param.Description ?? string.Empty
-                    };
-                    result.Add(paramInfo);
+                        name = param.Name,
+                        required = param.Default == null, // required if no default
+                        @default = param.Default,
+                        description = param.Description ?? string.Empty
+                    });
                 }
             }
 
             return result;
         }
+
+        private static Dictionary<string, object?> BuildParameterEntry(
+            string name,
+            ParameterDefinition definition) => new()
+            {
+                ["name"] = name,
+                ["required"] = definition.Required ?? true,
+                ["default"] = definition.Default,
+                ["description"] = definition.Description ?? string.Empty
+            };
 
         /// <summary>
         /// Build a list of permission metadata info for the current user's role

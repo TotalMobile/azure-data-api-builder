@@ -25,7 +25,7 @@ using ZiggyCreatures.Caching.Fusion;
 
 namespace Azure.DataApiBuilder.Service.Tests.UnitTests
 {
-    [TestClass, TestCategory(TestCategory.MSSQL)]
+    [TestClass]
     public class RestServiceUnitTests
     {
         private static RestService _restService;
@@ -100,6 +100,113 @@ namespace Azure.DataApiBuilder.Service.Tests.UnitTests
 
         #endregion
 
+        #region Sub-directory Path Routing Tests
+
+        /// <summary>
+        /// Tests that sub-directory entity paths are correctly resolved.
+        /// </summary>
+        [DataTestMethod]
+        [DataRow("api/shopping-cart/item", "/api", "shopping-cart/item", "ShoppingCartItem", "")]
+        [DataRow("api/shopping-cart/item/id/123", "/api", "shopping-cart/item", "ShoppingCartItem", "id/123")]
+        [DataRow("api/invoice/item/categoryid/1/pieceid/2", "/api", "invoice/item", "InvoiceItem", "categoryid/1/pieceid/2")]
+        public void SubDirectoryPathRoutingTest(
+            string route,
+            string restPath,
+            string entityPath,
+            string expectedEntityName,
+            string expectedPrimaryKeyRoute)
+        {
+            InitializeTestWithEntityPath(restPath, entityPath, expectedEntityName);
+            string routeAfterPathBase = _restService.GetRouteAfterPathBase(route);
+            (string actualEntityName, string actualPrimaryKeyRoute) =
+                _restService.GetEntityNameAndPrimaryKeyRouteFromRoute(routeAfterPathBase);
+            Assert.AreEqual(expectedEntityName, actualEntityName);
+            Assert.AreEqual(expectedPrimaryKeyRoute, actualPrimaryKeyRoute);
+        }
+
+        /// <summary>
+        /// Tests longest-prefix matching: when both "cart" and "cart/item" are valid entity paths,
+        /// a request to "/cart/item/id/123" should match "cart/item" (longest match wins).
+        /// </summary>
+        [TestMethod]
+        public void LongestPrefixMatchingTest()
+        {
+            InitializeTestWithMultipleEntityPaths("/api", new Dictionary<string, string>
+            {
+                { "cart", "CartEntity" },
+                { "cart/item", "CartItemEntity" }
+            });
+
+            string routeAfterPathBase = _restService.GetRouteAfterPathBase("api/cart/item/id/123");
+            (string actualEntityName, string actualPrimaryKeyRoute) =
+                _restService.GetEntityNameAndPrimaryKeyRouteFromRoute(routeAfterPathBase);
+
+            // Should match "cart/item" (longest), not "cart" (shortest)
+            Assert.AreEqual("CartItemEntity", actualEntityName);
+            Assert.AreEqual("id/123", actualPrimaryKeyRoute);
+        }
+
+        /// <summary>
+        /// Tests that when only shorter path exists, it matches correctly.
+        /// </summary>
+        [TestMethod]
+        public void SinglePathMatchingTest()
+        {
+            InitializeTestWithMultipleEntityPaths("/api", new Dictionary<string, string>
+            {
+                { "cart", "CartEntity" }
+            });
+
+            string routeAfterPathBase = _restService.GetRouteAfterPathBase("api/cart/id/123");
+            (string actualEntityName, string actualPrimaryKeyRoute) =
+                _restService.GetEntityNameAndPrimaryKeyRouteFromRoute(routeAfterPathBase);
+
+            Assert.AreEqual("CartEntity", actualEntityName);
+            Assert.AreEqual("id/123", actualPrimaryKeyRoute);
+        }
+
+        #endregion
+
+        #region MCP Path Guard Tests
+
+        /// <summary>
+        /// When MCP is explicitly disabled and the route matches the MCP path (default or custom),
+        /// GetRouteAfterPathBase should throw GlobalMcpEndpointDisabled.
+        /// </summary>
+        [DataTestMethod]
+        [DataRow("/mcp", "mcp", DisplayName = "MCP disabled with default path")]
+        [DataRow("/custom-mcp", "custom-mcp", DisplayName = "MCP disabled with custom path")]
+        public void McpPathThrowsWhenMcpDisabled(string mcpPath, string route)
+        {
+            InitializeTestWithMcpConfig("/api", new McpRuntimeOptions(Enabled: false, Path: mcpPath));
+            DataApiBuilderException ex = Assert.ThrowsException<DataApiBuilderException>(
+                () => _restService.GetRouteAfterPathBase(route));
+            Assert.AreEqual(HttpStatusCode.NotFound, ex.StatusCode);
+            Assert.AreEqual(DataApiBuilderException.SubStatusCodes.GlobalMcpEndpointDisabled, ex.SubStatusCode);
+        }
+
+        /// <summary>
+        /// When MCP is enabled (explicitly or by default when config is absent),
+        /// the MCP path route should NOT throw GlobalMcpEndpointDisabled.
+        /// It falls through to the normal path-base check.
+        /// </summary>
+        [DataTestMethod]
+        [DataRow(true, DisplayName = "MCP explicitly enabled")]
+        [DataRow(null, DisplayName = "MCP config absent (defaults to enabled)")]
+        public void McpPathDoesNotThrowGlobalMcpEndpointDisabledWhenMcpEnabled(bool? mcpEnabled)
+        {
+            McpRuntimeOptions mcpOptions = mcpEnabled.HasValue ? new McpRuntimeOptions(Enabled: mcpEnabled.Value) : null;
+            InitializeTestWithMcpConfig("/api", mcpOptions);
+            // "mcp" doesn't start with "api", so it should throw BadRequest (invalid path),
+            // NOT GlobalMcpEndpointDisabled.
+            DataApiBuilderException ex = Assert.ThrowsException<DataApiBuilderException>(
+                () => _restService.GetRouteAfterPathBase("mcp"));
+            Assert.AreEqual(HttpStatusCode.BadRequest, ex.StatusCode);
+            Assert.AreEqual(DataApiBuilderException.SubStatusCodes.BadRequest, ex.SubStatusCode);
+        }
+
+        #endregion
+
         #region Helper Functions
 
         /// <summary>
@@ -109,13 +216,54 @@ namespace Azure.DataApiBuilder.Service.Tests.UnitTests
         /// <param name="restRoutePrefix">path to return from mocked config.</param>
         public static void InitializeTest(string restRoutePrefix, string entityName)
         {
+            InitializeTestWithEntityPaths(restRoutePrefix, new Dictionary<string, string> { { entityName, entityName } });
+        }
+
+        /// <summary>
+        /// Needed for the callback that is required
+        /// to make use of out parameter with mocking.
+        /// Without use of delegate the out param will
+        /// not be populated with the correct value.
+        /// This delegate is for the callback used
+        /// with the mocked MetadataProvider.
+        /// </summary>
+        /// <param name="entityPath">The entity path.</param>
+        /// <param name="entity">Name of entity.</param>
+        delegate void metaDataCallback(string entityPath, out string entity);
+
+        /// <summary>
+        /// Initializes test with a sub-directory entity path.
+        /// </summary>
+        /// <param name="restRoutePrefix">REST path prefix (e.g., "/api").</param>
+        /// <param name="entityPath">Entity path with sub-directories (e.g., "shopping-cart/item").</param>
+        /// <param name="entityName">Name of the entity.</param>
+        public static void InitializeTestWithEntityPath(string restRoutePrefix, string entityPath, string entityName)
+        {
+            InitializeTestWithEntityPaths(restRoutePrefix, new Dictionary<string, string> { { entityPath, entityName } });
+        }
+
+        /// <summary>
+        /// Initializes test with multiple entity paths for testing overlapping path scenarios.
+        /// </summary>
+        /// <param name="restRoutePrefix">REST path prefix (e.g., "/api").</param>
+        /// <param name="entityPaths">Dictionary mapping entity paths to entity names.</param>
+        public static void InitializeTestWithMultipleEntityPaths(string restRoutePrefix, Dictionary<string, string> entityPaths)
+        {
+            InitializeTestWithEntityPaths(restRoutePrefix, entityPaths);
+        }
+
+        /// <summary>
+        /// Core helper to initialize REST Service with specified entity path mappings.
+        /// </summary>
+        private static void InitializeTestWithEntityPaths(string restRoutePrefix, Dictionary<string, string> entityPaths, McpRuntimeOptions mcpOptions = null, bool useMcpParam = false)
+        {
             RuntimeConfig mockConfig = new(
                Schema: "",
                DataSource: new(DatabaseType.PostgreSQL, "", new()),
                Runtime: new(
                    Rest: new(Path: restRoutePrefix),
                    GraphQL: new(),
-                   Mcp: new(),
+                   Mcp: useMcpParam ? mcpOptions : (mcpOptions ?? new()),
                    Host: new(null, null)
                ),
                Entities: new(new Dictionary<string, Entity>())
@@ -147,7 +295,10 @@ namespace Azure.DataApiBuilder.Service.Tests.UnitTests
             queryManagerFactory.Setup(x => x.GetQueryExecutor(It.IsAny<DatabaseType>())).Returns(queryExecutor);
 
             RuntimeConfig loadedConfig = provider.GetConfig();
-            loadedConfig.TryAddEntityPathNameToEntityName(entityName, entityName);
+            foreach (KeyValuePair<string, string> mapping in entityPaths)
+            {
+                loadedConfig.TryAddEntityPathNameToEntityName(mapping.Key, mapping.Value);
+            }
 
             Mock<ISqlMetadataProvider> sqlMetadataProvider = new();
             Mock<IAuthorizationService> authorizationService = new();
@@ -197,16 +348,14 @@ namespace Azure.DataApiBuilder.Service.Tests.UnitTests
         }
 
         /// <summary>
-        /// Needed for the callback that is required
-        /// to make use of out parameter with mocking.
-        /// Without use of delegate the out param will
-        /// not be populated with the correct value.
-        /// This delegate is for the callback used
-        /// with the mocked MetadataProvider.
+        /// Initializes RestService with a specific MCP configuration for testing MCP path guard behavior.
         /// </summary>
-        /// <param name="entityPath">The entity path.</param>
-        /// <param name="entity">Name of entity.</param>
-        delegate void metaDataCallback(string entityPath, out string entity);
+        /// <param name="restRoutePrefix">REST path prefix (e.g., "/api").</param>
+        /// <param name="mcpOptions">MCP options, or null to simulate absent mcp config block.</param>
+        private static void InitializeTestWithMcpConfig(string restRoutePrefix, McpRuntimeOptions mcpOptions)
+        {
+            InitializeTestWithEntityPaths(restRoutePrefix, new Dictionary<string, string>(), mcpOptions, useMcpParam: true);
+        }
         #endregion
     }
 }

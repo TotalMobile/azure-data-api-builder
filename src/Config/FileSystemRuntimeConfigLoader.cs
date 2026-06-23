@@ -6,6 +6,7 @@ using System.IO.Abstractions;
 using System.Net;
 using System.Reflection;
 using System.Text.Json;
+using Azure.DataApiBuilder.Config.Converters;
 using Azure.DataApiBuilder.Config.ObjectModel;
 using Azure.DataApiBuilder.Config.Utilities;
 using Azure.DataApiBuilder.Service.Exceptions;
@@ -29,8 +30,9 @@ namespace Azure.DataApiBuilder.Config;
 /// which allows for mocking of the file system in tests, providing a way to run the test
 /// in isolation of other tests or the actual file system.
 /// </remarks>
-public class FileSystemRuntimeConfigLoader : RuntimeConfigLoader
+public class FileSystemRuntimeConfigLoader : RuntimeConfigLoader, IDisposable
 {
+    private bool _disposed;
     /// <summary>
     /// This stores either the default config name e.g. dab-config.json
     /// or user provided config file which could be a relative file path,
@@ -58,6 +60,11 @@ public class FileSystemRuntimeConfigLoader : RuntimeConfigLoader
     /// </summary>
     private readonly IFileSystem _fileSystem;
 
+    /// <summary>
+    /// Logger used to log all the events that occur inside of FileSystemRuntimeConfigLoader
+    /// </summary>
+    private ILogger<FileSystemRuntimeConfigLoader>? _logger;
+
     public const string CONFIGFILE_NAME = "dab-config";
     public const string CONFIG_EXTENSION = ".json";
     public const string ENVIRONMENT_PREFIX = "DAB_";
@@ -76,18 +83,47 @@ public class FileSystemRuntimeConfigLoader : RuntimeConfigLoader
     /// </summary>
     public string ConfigFilePath { get; internal set; }
 
+    /// <summary>
+    /// Indicates whether the most recent TryLoadConfig call encountered a parse error
+    /// that was already emitted to Console.Error.
+    /// </summary>
+    public bool IsParseErrorEmitted { get; private set; }
+
     public FileSystemRuntimeConfigLoader(
         IFileSystem fileSystem,
         HotReloadEventHandler<HotReloadEventArgs>? handler = null,
         string baseConfigFilePath = DEFAULT_CONFIG_FILE_NAME,
         string? connectionString = null,
-        bool isCliLoader = false)
+        bool isCliLoader = false,
+        ILogger<FileSystemRuntimeConfigLoader>? logger = null)
         : base(handler, connectionString)
     {
         _fileSystem = fileSystem;
         _baseConfigFilePath = baseConfigFilePath;
         ConfigFilePath = GetFinalConfigFilePath();
         _isCliLoader = isCliLoader;
+        _logger = logger;
+    }
+
+    /// <summary>
+    /// Disposes the config file watcher to release file handles and stop
+    /// monitoring the config file for changes.
+    /// </summary>
+    public void Dispose()
+    {
+        if (_disposed)
+        {
+            return;
+        }
+
+        _disposed = true;
+
+        if (_configFileWatcher is not null)
+        {
+            _configFileWatcher.NewFileContentsDetected -= OnNewFileContentsDetected;
+            _configFileWatcher.Dispose();
+            _configFileWatcher = null;
+        }
     }
 
     /// <summary>
@@ -182,21 +218,21 @@ public class FileSystemRuntimeConfigLoader : RuntimeConfigLoader
     /// </summary>
     /// <param name="path">The path to the dab-config.json file.</param>
     /// <param name="config">The loaded <c>RuntimeConfig</c>, or null if none was loaded.</param>
-    /// <param name="replaceEnvVar">Whether to replace environment variable with its
-    /// value or not while deserializing.</param>
     /// <param name="logger">ILogger for logging errors.</param>
     /// <param name="isDevMode">When not null indicates we need to overwrite mode and how to do so.</param>
+    /// <param name="replacementSettings">Settings for variable replacement during deserialization. If null, uses default settings with environment variable replacement disabled.</param>
     /// <returns>True if the config was loaded, otherwise false.</returns>
     public bool TryLoadConfig(
         string path,
         [NotNullWhen(true)] out RuntimeConfig? config,
-        bool replaceEnvVar = false,
         ILogger? logger = null,
-        bool? isDevMode = null)
+        bool? isDevMode = null,
+        DeserializationVariableReplacementSettings? replacementSettings = null)
     {
+        IsParseErrorEmitted = false;
         if (_fileSystem.File.Exists(path))
         {
-            Console.WriteLine($"Loading config file from {_fileSystem.Path.GetFullPath(path)}.");
+            SendLogToBufferOrLogger(LogLevel.Information, $"Loading config file from {_fileSystem.Path.GetFullPath(path)}.");
 
             // Use File.ReadAllText because DAB doesn't need write access to the file
             // and ensures the file handle is released immediately after reading.
@@ -215,7 +251,8 @@ public class FileSystemRuntimeConfigLoader : RuntimeConfigLoader
                 }
                 catch (IOException ex)
                 {
-                    Console.WriteLine($"IO Exception, retrying due to {ex.Message}");
+                    SendLogToBufferOrLogger(LogLevel.Warning, $"IO Exception, retrying due to {ex.Message}");
+
                     if (runCount == FileUtilities.RunLimit)
                     {
                         throw;
@@ -226,12 +263,20 @@ public class FileSystemRuntimeConfigLoader : RuntimeConfigLoader
                 }
             }
 
-            if (!string.IsNullOrEmpty(json) && TryParseConfig(json, out RuntimeConfig, connectionString: _connectionString, replaceEnvVar: replaceEnvVar))
+            // Use default replacement settings if none provided
+            replacementSettings ??= new DeserializationVariableReplacementSettings();
+
+            string? parseError = null;
+            if (!string.IsNullOrEmpty(json) && TryParseConfig(
+                json,
+                out RuntimeConfig,
+                out parseError,
+                replacementSettings,
+                connectionString: _connectionString))
             {
                 if (TrySetupConfigFileWatcher())
                 {
-                    Console.WriteLine("Monitoring config: {0} for hot-reloading.", ConfigFilePath);
-                    logger?.LogInformation("Monitoring config: {ConfigFilePath} for hot-reloading.", ConfigFilePath);
+                    SendLogToBufferOrLogger(LogLevel.Information, $"Monitoring config: {ConfigFilePath} for hot-reloading.");
                 }
 
                 // When isDevMode is not null it means we are in a hot-reload scenario, and need to save the previous
@@ -241,14 +286,7 @@ public class FileSystemRuntimeConfigLoader : RuntimeConfigLoader
                     // Log error when the mode is changed during hot-reload.
                     if (isDevMode != this.RuntimeConfig.IsDevelopmentMode())
                     {
-                        if (logger is null)
-                        {
-                            Console.WriteLine("Hot-reload doesn't support switching mode. Please restart the service to switch the mode.");
-                        }
-                        else
-                        {
-                            logger.LogError("Hot-reload doesn't support switching mode. Please restart the service to switch the mode.");
-                        }
+                        SendLogToBufferOrLogger(LogLevel.Error, "Hot-reload doesn't support switching mode. Please restart the service to switch the mode.");
                     }
 
                     RuntimeConfig.Runtime.Host.Mode = (bool)isDevMode ? HostMode.Development : HostMode.Production;
@@ -269,20 +307,18 @@ public class FileSystemRuntimeConfigLoader : RuntimeConfigLoader
                 RuntimeConfig = LastValidRuntimeConfig;
             }
 
+            if (parseError is not null)
+            {
+                SendLogToBufferOrLogger(LogLevel.Error, parseError);
+                IsParseErrorEmitted = true;
+            }
+
             config = null;
             return false;
         }
 
-        if (logger is null)
-        {
-            string errorMessage = $"Unable to find config file: {path} does not exist.";
-            Console.Error.WriteLine(errorMessage);
-        }
-        else
-        {
-            string errorMessage = "Unable to find config file: {path} does not exist.";
-            logger.LogError(message: errorMessage, path);
-        }
+        string errorMessage = $"Unable to find config file: {path} does not exist.";
+        SendLogToBufferOrLogger(LogLevel.Error, errorMessage);
 
         config = null;
         return false;
@@ -292,12 +328,13 @@ public class FileSystemRuntimeConfigLoader : RuntimeConfigLoader
     /// Tries to load the config file using the filename known to the RuntimeConfigLoader and for the default environment.
     /// </summary>
     /// <param name="config">The loaded <c>RuntimeConfig</c>, or null if none was loaded.</param>
-    /// <param name="replaceEnvVar">Whether to replace environment variable with its
-    /// value or not while deserializing.</param>
+    /// <param name="replacementSettings">Settings for variable replacement during deserialization. If null, uses default settings with environment variable replacement disabled.</param>
     /// <returns>True if the config was loaded, otherwise false.</returns>
     public override bool TryLoadKnownConfig([NotNullWhen(true)] out RuntimeConfig? config, bool replaceEnvVar = false)
     {
-        return TryLoadConfig(ConfigFilePath, out config, replaceEnvVar);
+        // Convert legacy replaceEnvVar parameter to replacement settings for backward compatibility
+        DeserializationVariableReplacementSettings? replacementSettings = new(azureKeyVaultOptions: null, doReplaceEnvVar: replaceEnvVar, doReplaceAkvVar: replaceEnvVar, envFailureMode: EnvironmentVariableReplacementFailureMode.Ignore);
+        return TryLoadConfig(ConfigFilePath, out config, replacementSettings: replacementSettings);
     }
 
     /// <summary>
@@ -307,7 +344,11 @@ public class FileSystemRuntimeConfigLoader : RuntimeConfigLoader
     private void HotReloadConfig(bool isDevMode, ILogger? logger = null)
     {
         logger?.LogInformation(message: "Starting hot-reload process for config: {ConfigFilePath}", ConfigFilePath);
-        if (!TryLoadConfig(ConfigFilePath, out _, replaceEnvVar: true, isDevMode: isDevMode))
+
+        // Use default replacement settings for hot reload
+        DeserializationVariableReplacementSettings replacementSettings = new(azureKeyVaultOptions: null, doReplaceEnvVar: true, doReplaceAkvVar: true);
+
+        if (!TryLoadConfig(ConfigFilePath, out _, logger: logger, isDevMode: isDevMode, replacementSettings: replacementSettings))
         {
             throw new DataApiBuilderException(
                 message: "Deserialization of the configuration file failed.",
@@ -467,7 +508,7 @@ public class FileSystemRuntimeConfigLoader : RuntimeConfigLoader
 
         string? schemaPath = _fileSystem.Path.Combine(assemblyDirectory, "dab.draft.schema.json");
         string schemaFileContent = _fileSystem.File.ReadAllText(schemaPath);
-        Dictionary<string, object>? jsonDictionary = JsonSerializer.Deserialize<Dictionary<string, object>>(schemaFileContent, GetSerializationOptions());
+        Dictionary<string, object>? jsonDictionary = JsonSerializer.Deserialize<Dictionary<string, object>>(schemaFileContent, GetSerializationOptions(replacementSettings: null));
 
         if (jsonDictionary is null)
         {
@@ -502,5 +543,37 @@ public class FileSystemRuntimeConfigLoader : RuntimeConfigLoader
     {
         _baseConfigFilePath = filePath;
         ConfigFilePath = filePath;
+    }
+
+    public void SetLogger(ILogger<FileSystemRuntimeConfigLoader> logger)
+    {
+        _logger = logger;
+    }
+
+    /// <summary>
+    /// Flush all logs from the buffer after the log level is set from the RuntimeConfig.
+    /// Logger needs to be present, or else the logs will be lost.
+    /// </summary>
+    public void FlushLogBuffer()
+    {
+        _logBuffer.FlushToLogger(_logger!);
+    }
+
+    /// <summary>
+    /// Helper method that sends the log to the buffer if the logger has not being set up.
+    /// Else, it will send the log to the logger.
+    /// </summary>
+    /// <param name="logLevel">LogLevel of the log.</param>
+    /// <param name="message">Message that will be printed in the log.</param>
+    private void SendLogToBufferOrLogger(LogLevel logLevel, string message)
+    {
+        if (_logger is null)
+        {
+            _logBuffer.BufferLog(logLevel, message);
+        }
+        else
+        {
+            _logger?.Log(logLevel, message);
+        }
     }
 }

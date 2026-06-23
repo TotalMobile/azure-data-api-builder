@@ -14,7 +14,7 @@ internal class EntityCacheOptionsConverterFactory : JsonConverterFactory
 {
     // Determines whether to replace environment variable with its
     // value or not while deserializing.
-    private bool _replaceEnvVar;
+    private readonly DeserializationVariableReplacementSettings? _replacementSettings;
 
     /// <inheritdoc/>
     public override bool CanConvert(Type typeToConvert)
@@ -25,27 +25,25 @@ internal class EntityCacheOptionsConverterFactory : JsonConverterFactory
     /// <inheritdoc/>
     public override JsonConverter? CreateConverter(Type typeToConvert, JsonSerializerOptions options)
     {
-        return new EntityCacheOptionsConverter(_replaceEnvVar);
+        return new EntityCacheOptionsConverter(_replacementSettings);
     }
 
-    /// <param name="replaceEnvVar">Whether to replace environment variable with its
-    /// value or not while deserializing.</param>
-    internal EntityCacheOptionsConverterFactory(bool replaceEnvVar)
+    /// <param name="replacementSettings">The replacement settings to use while deserializing.</param>
+    internal EntityCacheOptionsConverterFactory(DeserializationVariableReplacementSettings? replacementSettings)
     {
-        _replaceEnvVar = replaceEnvVar;
+        _replacementSettings = replacementSettings;
     }
 
     private class EntityCacheOptionsConverter : JsonConverter<EntityCacheOptions>
     {
         // Determines whether to replace environment variable with its
         // value or not while deserializing.
-        private bool _replaceEnvVar;
+        private readonly DeserializationVariableReplacementSettings? _replacementSettings;
 
-        /// <param name="replaceEnvVar">Whether to replace environment variable with its
-        /// value or not while deserializing.</param>
-        public EntityCacheOptionsConverter(bool replaceEnvVar)
+        /// <param name="replacementSettings">The replacement settings to use while deserializing.</param>
+        public EntityCacheOptionsConverter(DeserializationVariableReplacementSettings? replacementSettings)
         {
-            _replaceEnvVar = replaceEnvVar;
+            _replacementSettings = replacementSettings;
         }
 
         /// <summary>
@@ -57,7 +55,9 @@ internal class EntityCacheOptionsConverterFactory : JsonConverterFactory
         {
             if (reader.TokenType is JsonTokenType.StartObject)
             {
-                bool? enabled = false;
+                // Default to null (unset) so that an empty cache object ("cache": {})
+                // is treated as "not explicitly configured" and inherits from the runtime setting.
+                bool? enabled = null;
 
                 // Defer to EntityCacheOptions record definition to define default ttl value.
                 int? ttlSeconds = null;
@@ -110,7 +110,7 @@ internal class EntityCacheOptionsConverterFactory : JsonConverterFactory
                                 throw new JsonException("level property cannot be null.");
                             }
 
-                            level = EnumExtensions.Deserialize<EntityCacheLevel>(reader.DeserializeString(_replaceEnvVar)!);
+                            level = EnumExtensions.Deserialize<EntityCacheLevel>(reader.DeserializeString(_replacementSettings)!);
 
                             break;
                     }
@@ -121,16 +121,22 @@ internal class EntityCacheOptionsConverterFactory : JsonConverterFactory
         }
 
         /// <summary>
-        /// When writing the EntityCacheOptions back to a JSON file, only write the ttl-seconds
-        /// and level properties and values when EntityCacheOptions.Enabled is true.
-        /// This avoids polluting the written JSON file with a property the user most likely
-        /// omitted when writing the original DAB runtime config file.
-        /// This Write operation is only used when a RuntimeConfig object is serialized to JSON.
+        /// When writing the EntityCacheOptions back to a JSON file, only write each sub-property
+        /// when its corresponding UserProvided* flag is true. This avoids polluting the written
+        /// JSON file with properties the user omitted (defaults or inherited values).
+        /// If the user provided a cache object (Entity.Cache is non-null), we always write the
+        /// object — even if it ends up empty ("cache": {}) — because the user explicitly included it.
+        /// Entity.Cache being null means the user never wrote a cache property, and the serializer's
+        /// DefaultIgnoreCondition.WhenWritingNull suppresses the "cache" key entirely.
         /// </summary>
         public override void Write(Utf8JsonWriter writer, EntityCacheOptions value, JsonSerializerOptions options)
         {
             writer.WriteStartObject();
-            writer.WriteBoolean("enabled", value?.Enabled ?? false);
+
+            if (value?.UserProvidedEnabledOptions is true)
+            {
+                writer.WriteBoolean("enabled", value.Enabled!.Value);
+            }
 
             if (value?.UserProvidedTtlOptions is true)
             {

@@ -4,6 +4,7 @@
 using System.Security.Claims;
 using Azure.DataApiBuilder.Config.ObjectModel;
 using Azure.DataApiBuilder.Core.AuthenticationHelpers.AuthenticationSimulator;
+using Azure.DataApiBuilder.Core.AuthenticationHelpers.UnauthenticatedAuthentication;
 using Azure.DataApiBuilder.Core.Authorization;
 using Azure.DataApiBuilder.Core.Configurations;
 using Azure.DataApiBuilder.Core.Models;
@@ -62,7 +63,7 @@ public class ClientRoleHeaderAuthenticationMiddleware
         // Determine the authentication scheme to use based on dab-config.json.
         // Compatible with both ConfigureAuthentication and ConfigureAuthenticationV2 in startup.cs.
         // This means that this code is resilient to whether or not the default authentication scheme is set in startup.
-        string scheme = EasyAuthAuthenticationDefaults.SWAAUTHSCHEME;
+        string scheme = EasyAuthAuthenticationDefaults.APPSERVICEAUTHSCHEME;
         if (!_runtimeConfigProvider.IsLateConfigured)
         {
             AuthenticationOptions? dabAuthNOptions = _runtimeConfigProvider.GetConfig().Runtime?.Host?.Authentication;
@@ -191,6 +192,10 @@ public class ClientRoleHeaderAuthenticationMiddleware
         else if (string.Equals(configuredProviderName, SupportedAuthNProviders.SIMULATOR, StringComparison.OrdinalIgnoreCase))
         {
             return SimulatorAuthenticationDefaults.AUTHENTICATIONSCHEME;
+        }
+        else if (string.Equals(configuredProviderName, SupportedAuthNProviders.UNAUTHENTICATED, StringComparison.OrdinalIgnoreCase))
+        {
+            return UnauthenticatedAuthenticationDefaults.AUTHENTICATIONSCHEME;
         }
         else if (string.Equals(configuredProviderName, SupportedAuthNProviders.AZURE_AD, StringComparison.OrdinalIgnoreCase) ||
             string.Equals(configuredProviderName, SupportedAuthNProviders.ENTRA_ID, StringComparison.OrdinalIgnoreCase))

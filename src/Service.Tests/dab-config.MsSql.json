@@ -2,7 +2,7 @@
   "$schema": "https://github.com/Azure/data-api-builder/releases/download/vmajor.minor.patch/dab.draft.schema.json",
   "data-source": {
     "database-type": "mssql",
-    "connection-string": "Server=tcp:127.0.0.1,1433;Persist Security Info=False;User ID=sa;Password=REPLACEME;MultipleActiveResultSets=False;Connection Timeout=5;",
+    "connection-string": "Server=tcp:127.0.0.1,1433;Persist Security Info=False;User ID=sa;Password=REPLACEME;MultipleActiveResultSets=False;Connection Timeout=30;",
     "options": {
       "set-session-context": true
     }
@@ -36,7 +36,7 @@
         "allow-credentials": false
       },
       "authentication": {
-        "provider": "StaticWebApps"
+        "provider": "AppService"
       },
       "mode": "development"
     }
@@ -2890,7 +2890,10 @@
             }
           ]
         }
-      ]
+      ],
+      "mcp": {
+        "custom-tool": true
+      }
     },
     "GetBook": {
       "source": {
@@ -2928,7 +2931,10 @@
             }
           ]
         }
-      ]
+      ],
+      "mcp": {
+        "custom-tool": true
+      }
     },
     "GetPublisher": {
       "source": {
@@ -2966,7 +2972,10 @@
             }
           ]
         }
-      ]
+      ],
+      "mcp": {
+        "custom-tool": true
+      }
     },
     "InsertBook": {
       "source": {
@@ -3008,7 +3017,10 @@
             }
           ]
         }
-      ]
+      ],
+      "mcp": {
+        "custom-tool": true
+      }
     },
     "CountBooks": {
       "source": {
@@ -3046,7 +3058,10 @@
             }
           ]
         }
-      ]
+      ],
+      "mcp": {
+        "custom-tool": true
+      }
     },
     "DeleteLastInsertedBook": {
       "source": {

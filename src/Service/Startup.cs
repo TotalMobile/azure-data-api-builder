@@ -3,6 +3,8 @@
 
 using System;
 using System.IO.Abstractions;
+using System.Linq;
+using System.Net;
 using System.Net.Http;
 using System.Net.Http.Headers;
 using System.Threading.Tasks;
@@ -13,6 +15,7 @@ using Azure.DataApiBuilder.Config.ObjectModel;
 using Azure.DataApiBuilder.Config.Utilities;
 using Azure.DataApiBuilder.Core.AuthenticationHelpers;
 using Azure.DataApiBuilder.Core.AuthenticationHelpers.AuthenticationSimulator;
+using Azure.DataApiBuilder.Core.AuthenticationHelpers.UnauthenticatedAuthentication;
 using Azure.DataApiBuilder.Core.Authorization;
 using Azure.DataApiBuilder.Core.Configurations;
 using Azure.DataApiBuilder.Core.Models;
@@ -53,6 +56,7 @@ using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
+using Microsoft.Identity.Client;
 using NodaTime;
 using OpenTelemetry.Exporter;
 using OpenTelemetry.Logs;
@@ -66,6 +70,7 @@ using ZiggyCreatures.Caching.Fusion;
 using ZiggyCreatures.Caching.Fusion.Backplane.StackExchangeRedis;
 using ZiggyCreatures.Caching.Fusion.Serialization.SystemTextJson;
 using CorsOptions = Azure.DataApiBuilder.Config.ObjectModel.CorsOptions;
+using LogLevel = Microsoft.Extensions.Logging.LogLevel;
 
 namespace Azure.DataApiBuilder.Service
 {
@@ -73,7 +78,7 @@ namespace Azure.DataApiBuilder.Service
     {
         public static LogLevel MinimumLogLevel = LogLevel.Error;
 
-        public static bool IsLogLevelOverriddenByCli;
+        public static bool IsCliOverriding;
 
         public static AzureLogAnalyticsCustomLogCollector CustomLogCollector = new();
         public static ApplicationInsightsOptions AppInsightsOptions = new();
@@ -84,6 +89,7 @@ namespace Azure.DataApiBuilder.Service
         private readonly HotReloadEventHandler<HotReloadEventArgs> _hotReloadEventHandler = new();
         private RuntimeConfigProvider? _configProvider;
         private ILogger<Startup> _logger = logger;
+        private LogBuffer _logBuffer = new();
 
         public IConfiguration Configuration { get; } = configuration;
 
@@ -100,6 +106,7 @@ namespace Azure.DataApiBuilder.Service
         public void ConfigureServices(IServiceCollection services)
         {
             Startup.AddValidFilters();
+            services.AddSingleton(Program.LogLevelProvider);
             services.AddSingleton(_hotReloadEventHandler);
             string configFileName = Configuration.GetValue<string>("ConfigFileName") ?? FileSystemRuntimeConfigLoader.DEFAULT_CONFIG_FILE_NAME;
             string? connectionString = Configuration.GetValue<string?>(
@@ -111,7 +118,7 @@ namespace Azure.DataApiBuilder.Service
             _configProvider = configProvider;
 
             services.AddSingleton(fileSystem);
-            services.AddSingleton(configLoader);
+            services.AddSingleton<FileSystemRuntimeConfigLoader>(sp => configLoader);
             services.AddSingleton(configProvider);
 
             bool runtimeConfigAvailable = configProvider.TryGetConfig(out RuntimeConfig? runtimeConfig);
@@ -128,7 +135,8 @@ namespace Azure.DataApiBuilder.Service
 
             if (runtimeConfigAvailable
                 && runtimeConfig?.Runtime?.Telemetry?.OpenTelemetry is not null
-                && runtimeConfig.Runtime.Telemetry.OpenTelemetry.Enabled)
+                && runtimeConfig.Runtime.Telemetry.OpenTelemetry.Enabled
+                && Uri.TryCreate(runtimeConfig.Runtime.Telemetry.OpenTelemetry.Endpoint, UriKind.Absolute, out Uri? otlpEndpoint))
             {
                 services.Configure<OpenTelemetryLoggerOptions>(options =>
                 {
@@ -142,7 +150,7 @@ namespace Azure.DataApiBuilder.Service
                     logging.SetResourceBuilder(ResourceBuilder.CreateDefault().AddService(runtimeConfig.Runtime.Telemetry.OpenTelemetry.ServiceName!))
                     .AddOtlpExporter(configure =>
                     {
-                        configure.Endpoint = new Uri(runtimeConfig.Runtime.Telemetry.OpenTelemetry.Endpoint!);
+                        configure.Endpoint = otlpEndpoint;
                         configure.Headers = runtimeConfig.Runtime.Telemetry.OpenTelemetry.Headers;
                         configure.Protocol = OtlpExportProtocol.Grpc;
                     });
@@ -151,32 +159,32 @@ namespace Azure.DataApiBuilder.Service
                 .WithMetrics(metrics =>
                 {
                     metrics.SetResourceBuilder(ResourceBuilder.CreateDefault().AddService(runtimeConfig.Runtime.Telemetry.OpenTelemetry.ServiceName!))
-                        // TODO: should we also add FusionCache metrics?
-                        // To do so we just need to add the package ZiggyCreatures.FusionCache.OpenTelemetry and call
-                        // .AddFusionCacheInstrumentation()
-                        .AddOtlpExporter(configure =>
-                        {
-                            configure.Endpoint = new Uri(runtimeConfig.Runtime.Telemetry.OpenTelemetry.Endpoint!);
-                            configure.Headers = runtimeConfig.Runtime.Telemetry.OpenTelemetry.Headers;
-                            configure.Protocol = OtlpExportProtocol.Grpc;
-                        })
-                        .AddMeter(TelemetryMetricsHelper.MeterName);
+                    // TODO: should we also add FusionCache metrics?
+                    // To do so we just need to add the package ZiggyCreatures.FusionCache.OpenTelemetry and call
+                    // .AddFusionCacheInstrumentation()
+                    .AddOtlpExporter(configure =>
+                    {
+                        configure.Endpoint = otlpEndpoint;
+                        configure.Headers = runtimeConfig.Runtime.Telemetry.OpenTelemetry.Headers;
+                        configure.Protocol = OtlpExportProtocol.Grpc;
+                    })
+                    .AddMeter(TelemetryMetricsHelper.MeterName);
                 })
                 .WithTracing(tracing =>
                 {
                     tracing.SetResourceBuilder(ResourceBuilder.CreateDefault().AddService(runtimeConfig.Runtime.Telemetry.OpenTelemetry.ServiceName!))
-                        .AddHttpClientInstrumentation()
-                        // TODO: should we also add FusionCache traces?
-                        // To do so we just need to add the package ZiggyCreatures.FusionCache.OpenTelemetry and call
-                        // .AddFusionCacheInstrumentation()
-                        .AddHotChocolateInstrumentation()
-                        .AddOtlpExporter(configure =>
-                        {
-                            configure.Endpoint = new Uri(runtimeConfig.Runtime.Telemetry.OpenTelemetry.Endpoint!);
-                            configure.Headers = runtimeConfig.Runtime.Telemetry.OpenTelemetry.Headers;
-                            configure.Protocol = OtlpExportProtocol.Grpc;
-                        })
-                        .AddSource(TelemetryTracesHelper.DABActivitySource.Name);
+                    .AddHttpClientInstrumentation()
+                    // TODO: should we also add FusionCache traces?
+                    // To do so we just need to add the package ZiggyCreatures.FusionCache.OpenTelemetry and call
+                    // .AddFusionCacheInstrumentation()
+                    .AddHotChocolateInstrumentation()
+                    .AddOtlpExporter(configure =>
+                    {
+                        configure.Endpoint = otlpEndpoint;
+                        configure.Headers = runtimeConfig.Runtime.Telemetry.OpenTelemetry.Headers;
+                        configure.Protocol = OtlpExportProtocol.Grpc;
+                    })
+                    .AddSource(TelemetryTracesHelper.DABActivitySource.Name);
                 });
             }
 
@@ -225,6 +233,13 @@ namespace Azure.DataApiBuilder.Service
             services.AddHealthChecks()
                 .AddCheck<BasicHealthCheck>(nameof(BasicHealthCheck));
 
+            services.AddSingleton<ILogger<FileSystemRuntimeConfigLoader>>(implementationFactory: (serviceProvider) =>
+            {
+                LogLevelInitializer logLevelInit = new(MinimumLogLevel, typeof(FileSystemRuntimeConfigLoader).FullName, _configProvider, _hotReloadEventHandler);
+                ILoggerFactory? loggerFactory = CreateLoggerFactoryForHostedAndNonHostedScenario(serviceProvider, logLevelInit);
+                return loggerFactory.CreateLogger<FileSystemRuntimeConfigLoader>();
+            });
+
             services.AddSingleton<ILogger<SqlQueryEngine>>(implementationFactory: (serviceProvider) =>
             {
                 LogLevelInitializer logLevelInit = new(MinimumLogLevel, typeof(SqlQueryEngine).FullName, _configProvider, _hotReloadEventHandler);
@@ -249,6 +264,38 @@ namespace Azure.DataApiBuilder.Service
             // Below are the factory registrations that will enable multiple databases scenario.
             // within these factories the various instances will be created based on the database type and datasourceName.
             services.AddSingleton<IAbstractQueryManagerFactory, QueryManagerFactory>();
+
+            // Register IOboTokenProvider only when user-delegated auth is configured.
+            // This avoids registering a null singleton and supports hot-reload scenarios.
+            // Requires environment variables: DAB_OBO_CLIENT_ID, DAB_OBO_TENANT_ID, DAB_OBO_CLIENT_SECRET
+            //
+            // Design note: A single IOboTokenProvider is registered using one Azure AD app registration.
+            // Multiple databases with different database-audience values ARE supported - the audience
+            // is passed to GetAccessTokenOnBehalfOfAsync() at query execution time, allowing the same
+            // MSAL client to acquire tokens for different resource servers.
+            if (IsOboConfigured())
+            {
+                // Register IMsalClientWrapper for dependency injection
+                services.AddSingleton<IMsalClientWrapper>(serviceProvider =>
+                {
+                    string? clientId = Environment.GetEnvironmentVariable(UserDelegatedAuthOptions.DAB_OBO_CLIENT_ID_ENV_VAR);
+                    string? tenantId = Environment.GetEnvironmentVariable(UserDelegatedAuthOptions.DAB_OBO_TENANT_ID_ENV_VAR);
+                    string? clientSecret = Environment.GetEnvironmentVariable(UserDelegatedAuthOptions.DAB_OBO_CLIENT_SECRET_ENV_VAR);
+
+                    string authority = $"https://login.microsoftonline.com/{tenantId}";
+
+                    IConfidentialClientApplication msalClient = ConfidentialClientApplicationBuilder
+                        .Create(clientId)
+                        .WithAuthority(authority)
+                        .WithClientSecret(clientSecret)
+                        .Build();
+
+                    return new MsalClientWrapper(msalClient);
+                });
+
+                // Register OboSqlTokenProvider with dependencies from DI
+                services.AddSingleton<IOboTokenProvider, OboSqlTokenProvider>();
+            }
 
             services.AddSingleton<IQueryEngineFactory, QueryEngineFactory>();
 
@@ -348,7 +395,16 @@ namespace Azure.DataApiBuilder.Service
                     return handler;
                 });
 
-            if (runtimeConfig is not null && runtimeConfig.Runtime?.Host?.Mode is HostMode.Development)
+            bool isMcpStdio = Configuration.GetValue<bool>("MCP:StdioMode");
+
+            if (isMcpStdio)
+            {
+                // Explicitly force Simulator when running in MCP stdio mode.
+                services.AddAuthentication(
+                        defaultScheme: SimulatorAuthenticationDefaults.AUTHENTICATIONSCHEME)
+                    .AddSimulatorAuthentication();
+            }
+            else if (runtimeConfig is not null && runtimeConfig.Runtime?.Host?.Mode is HostMode.Development)
             {
                 // Development mode implies support for "Hot Reload". The V2 authentication function
                 // wires up all DAB supported authentication providers (schemes) so that at request time,
@@ -426,7 +482,7 @@ namespace Azure.DataApiBuilder.Service
                         else
                         {
                             // NOTE: this is done to reuse the same connection multiplexer for both the cache and backplane
-                            Task<ConnectionMultiplexer> connectionMultiplexerTask = ConnectionMultiplexer.ConnectAsync(level2CacheOptions.ConnectionString);
+                            Task<IConnectionMultiplexer> connectionMultiplexerTask = CreateConnectionMultiplexerAsync(level2CacheOptions.ConnectionString);
 
                             fusionCacheBuilder
                                 .WithSerializer(new FusionCacheSystemTextJsonSerializer())
@@ -456,7 +512,94 @@ namespace Azure.DataApiBuilder.Service
 
             services.AddDabMcpServer(configProvider);
 
+            services.AddSingleton<IMcpStdioServer, McpStdioServer>();
+
+            // Add Response Compression services based on config
+            ConfigureResponseCompression(services, runtimeConfig);
+
             services.AddControllers();
+        }
+
+        /// <summary>
+        /// Creates a ConnectionMultiplexer for Redis with support for Azure Entra authentication.
+        /// </summary>
+        /// <param name="connectionString">The Redis connection string.</param>
+        /// <returns>A task that represents the asynchronous operation. The task result contains the connected IConnectionMultiplexer.</returns>
+        private static async Task<IConnectionMultiplexer> CreateConnectionMultiplexerAsync(string connectionString)
+        {
+            ConfigurationOptions options = ConfigurationOptions.Parse(connectionString);
+
+            if (ShouldUseEntraAuthForRedis(options))
+            {
+                options = await options.ConfigureForAzureWithTokenCredentialAsync(new DefaultAzureCredential()); // CodeQL [SM05137] DefaultAzureCredential will use Managed Identity if available or fallback to default.
+            }
+
+            return await ConnectionMultiplexer.ConnectAsync(options);
+        }
+
+        /// <summary>
+        /// Determines whether Azure Entra authentication should be used.
+        /// Conditions:
+        /// - No password provided
+        /// - At least one endpoint is NOT localhost/loopback
+        /// </summary>
+        /// <param name="options">The Redis configuration options.</param>
+        /// <returns>True if Azure Entra authentication should be used; otherwise, false.</returns>
+        /// <remarks>Internal for testing.</remarks>
+        internal static bool ShouldUseEntraAuthForRedis(ConfigurationOptions options)
+        {
+            // Determine if an endpoint is localhost/loopback
+            static bool IsLocalhostEndpoint(EndPoint ep) => ep switch
+            {
+                DnsEndPoint dns => string.Equals(dns.Host, "localhost", StringComparison.OrdinalIgnoreCase),
+                IPEndPoint ip => IPAddress.IsLoopback(ip.Address),
+                _ => false,
+            };
+
+            return string.IsNullOrEmpty(options.Password)
+                && options.EndPoints.Any(ep => !IsLocalhostEndpoint(ep));
+        }
+
+        /// <summary>
+        /// Configures HTTP response compression based on the runtime configuration.
+        /// Compression is applied at the middleware level and supports Gzip and Brotli.
+        /// Applies to REST, GraphQL, and MCP endpoints.
+        /// </summary>
+        private void ConfigureResponseCompression(IServiceCollection services, RuntimeConfig? runtimeConfig)
+        {
+            CompressionLevel compressionLevel = runtimeConfig?.Runtime?.Compression?.Level ?? CompressionOptions.DEFAULT_LEVEL;
+
+            // Only configure compression if level is not None
+            if (compressionLevel == CompressionLevel.None)
+            {
+                return;
+            }
+
+            System.IO.Compression.CompressionLevel systemCompressionLevel = compressionLevel switch
+            {
+                CompressionLevel.Fastest => System.IO.Compression.CompressionLevel.Fastest,
+                CompressionLevel.Optimal => System.IO.Compression.CompressionLevel.Optimal,
+                _ => System.IO.Compression.CompressionLevel.Optimal
+            };
+
+            services.AddResponseCompression(options =>
+            {
+                options.EnableForHttps = true;
+                options.Providers.Add<Microsoft.AspNetCore.ResponseCompression.GzipCompressionProvider>();
+                options.Providers.Add<Microsoft.AspNetCore.ResponseCompression.BrotliCompressionProvider>();
+            });
+
+            services.Configure<Microsoft.AspNetCore.ResponseCompression.GzipCompressionProviderOptions>(options =>
+            {
+                options.Level = systemCompressionLevel;
+            });
+
+            services.Configure<Microsoft.AspNetCore.ResponseCompression.BrotliCompressionProviderOptions>(options =>
+            {
+                options.Level = systemCompressionLevel;
+            });
+
+            _logBuffer.BufferLog(LogLevel.Information, $"Response compression enabled with level '{compressionLevel}' for REST, GraphQL, and MCP endpoints.");
         }
 
         /// <summary>
@@ -471,16 +614,50 @@ namespace Azure.DataApiBuilder.Service
         private void AddGraphQLService(IServiceCollection services, GraphQLRuntimeOptions? graphQLRuntimeOptions)
         {
             IRequestExecutorBuilder server = services.AddGraphQLServer()
+                // Defer schema construction to the first GraphQL request so the runtime config
+                // is available for both file-based and POST /configuration (hosted) scenarios.
+                // See docs/design/HC16-upgrade.md for the full rationale.
+                .ModifyOptions(options => options.LazyInitialization = true)
                 .AddInstrumentation()
-                .AddType(new DateTimeType(disableFormatCheck: graphQLRuntimeOptions?.EnableLegacyDateTimeScalar ?? true))
+                .AddType(new DateTimeType(new DateTimeOptions { ValidateInputFormat = !(graphQLRuntimeOptions?.EnableLegacyDateTimeScalar ?? true) }))
                 .AddHttpRequestInterceptor<DefaultHttpRequestInterceptor>()
                 .ConfigureSchema((serviceProvider, schemaBuilder) =>
                 {
-                    // The GraphQLSchemaCreator is an application service that is not available on
-                    // the schema specific service provider, this means we have to get it with
-                    // the GetRootServiceProvider helper.
-                    GraphQLSchemaCreator graphQLService = serviceProvider.GetRootServiceProvider().GetRequiredService<GraphQLSchemaCreator>();
-                    graphQLService.InitializeSchemaAndResolvers(schemaBuilder);
+                    // Runs on first GraphQL request (LazyInitialization). The placeholder
+                    // fallback covers GraphQL-disabled configs and schema-construction failures.
+                    RuntimeConfigProvider configProvider = serviceProvider.GetRootServiceProvider()
+                        .GetRequiredService<RuntimeConfigProvider>();
+                    if (!configProvider.TryGetConfig(out RuntimeConfig? loadedConfig))
+                    {
+                        EmitPlaceholderSchema(schemaBuilder);
+                        return;
+                    }
+
+                    if (!loadedConfig.IsGraphQLEnabled)
+                    {
+                        EmitPlaceholderSchema(schemaBuilder);
+                        return;
+                    }
+
+                    try
+                    {
+                        // The GraphQLSchemaCreator is an application service that is not available on 
+                        // the schema specific service provider, this means we have to get it with 
+                        // the GetRootServiceProvider helper.
+                        GraphQLSchemaCreator graphQLService = serviceProvider.GetRootServiceProvider().GetRequiredService<GraphQLSchemaCreator>();
+                        graphQLService.InitializeSchemaAndResolvers(schemaBuilder);
+                    }
+                    catch (Exception ex)
+                    {
+                        // Schema construction failed (e.g. metadata provider was not initialized
+                        // due to a config validation error). Fall back to the placeholder schema
+                        // so the host can still start; the underlying error will have already
+                        // been surfaced by Startup.PerformOnConfigChangeAsync.
+                        _logger.LogWarning(
+                            exception: ex,
+                            message: "Failed to build GraphQL schema; emitting placeholder schema. The error will surface on first GraphQL request and is typically caused by a runtime config that failed validation.");
+                        EmitPlaceholderSchema(schemaBuilder);
+                    }
                 })
                 .AddHttpRequestInterceptor<IntrospectionInterceptor>()
                 .AddAuthorizationHandler<GraphQLAuthorizationHandler>()
@@ -505,42 +682,42 @@ namespace Azure.DataApiBuilder.Service
             {
                 if (error.Exception is not null)
                 {
-                    _logger.LogError(exception: error.Exception, message: "A GraphQL request execution error occurred.");
+                    _logger.LogError(error.Exception, "A GraphQL request execution error occurred.");
                     return error.WithMessage(error.Exception.Message);
                 }
 
                 if (error.Code is not null)
                 {
-                    _logger.LogError(message: "Error code: {errorCode}\nError message: {errorMessage}", error.Code, error.Message);
+                    _logger.LogError($"Error code: {error.Code}\nError message: {error.Message}");
                     return error.WithMessage(error.Message);
                 }
 
                 return error;
             })
-                .AddErrorFilter(error =>
+            .AddErrorFilter(error =>
+            {
+                if (error.Exception is DataApiBuilderException thrownException)
                 {
-                    if (error.Exception is DataApiBuilderException thrownException)
+                    error = error
+                        .WithException(null)
+                        .WithMessage(thrownException.Message)
+                        .WithCode($"{thrownException.SubStatusCode}");
+
+                    // If user error i.e. validation error or conflict error with datasource, then retain location/path
+                    if (!thrownException.StatusCode.IsClientError())
                     {
-                        error = error
-                            .WithException(null)
-                            .WithMessage(thrownException.Message)
-                            .WithCode($"{thrownException.SubStatusCode}");
-
-                        // If user error i.e. validation error or conflict error with datasource, then retain location/path
-                        if (!thrownException.StatusCode.IsClientError())
-                        {
-                            error = error.WithLocations(Array.Empty<Location>());
-                        }
+                        error = error.WithLocations(Array.Empty<Location>());
                     }
+                }
 
-                    return error;
-                })
-                // Allows DAB to override the HTTP error code set by HotChocolate.
-                // This is used to ensure HTTP code 4XX is set when the datatbase
-                // returns a "bad request" error such as stored procedure params missing.
-                .UseRequest<DetermineStatusCodeMiddleware>()
-                .UseRequest<BuildRequestStateMiddleware>()
-                .UseDefaultPipeline();
+                return error;
+            })
+            // Allows DAB to override the HTTP error code set by HotChocolate.
+            // This is used to ensure HTTP code 4XX is set when the datatbase
+            // returns a "bad request" error such as stored procedure params missing.
+            .UseRequest<DetermineStatusCodeMiddleware>()
+            .UseRequest<BuildRequestStateMiddleware>()
+            .UseDefaultPipeline();
         }
 
         /// <summary>
@@ -558,35 +735,81 @@ namespace Azure.DataApiBuilder.Service
         public void Configure(IApplicationBuilder app, IWebHostEnvironment env, RuntimeConfigProvider runtimeConfigProvider, IHostApplicationLifetime hostLifetime)
         {
             bool isRuntimeReady = false;
+            RuntimeConfig? runtimeConfig = null;
 
-            if (runtimeConfigProvider.TryGetConfig(out RuntimeConfig? runtimeConfig))
+            // Wire a logger on the DynamicLogLevelProvider as soon as ILoggerFactory is available
+            // — ahead of any config-load branch — so an early MCP logging/setLevel call (which can
+            // arrive before runtime config in the late-configured path) still surfaces its audit
+            // log line through the standard logging pipeline.
+            DynamicLogLevelProvider? logLevelProviderForAudit = app.ApplicationServices.GetService<DynamicLogLevelProvider>();
+            ILoggerFactory? earlyLoggerFactory = app.ApplicationServices.GetService<ILoggerFactory>();
+            if (logLevelProviderForAudit is not null && earlyLoggerFactory is not null)
             {
-                // Configure Application Insights Telemetry
-                ConfigureApplicationInsightsTelemetry(app, runtimeConfig);
-                ConfigureOpenTelemetry(runtimeConfig);
-                ConfigureAzureLogAnalytics(runtimeConfig);
-                ConfigureFileSink(app, runtimeConfig);
+                logLevelProviderForAudit.Logger = earlyLoggerFactory.CreateLogger<DynamicLogLevelProvider>();
+            }
 
-                // Config provided before starting the engine.
-                isRuntimeReady = PerformOnConfigChangeAsync(app).Result;
-
-                if (!isRuntimeReady)
+            try
+            {
+                if (runtimeConfigProvider.TryGetConfig(out runtimeConfig))
                 {
-                    _logger.LogError(
-                        message: "Could not initialize the engine with the runtime config file: {configFilePath}",
-                        runtimeConfigProvider.ConfigFilePath);
-                    hostLifetime.StopApplication();
+                    // Create log level initializer for Startup, which allows it to respond to runtime config changes and update the log level accordingly.
+                    LogLevelInitializer logLevelInit = new(MinimumLogLevel, typeof(Startup).FullName, runtimeConfigProvider, _hotReloadEventHandler);
+
+                    // Set LogLevel based on RuntimeConfig
+                    DynamicLogLevelProvider logLevelProvider = app.ApplicationServices.GetRequiredService<DynamicLogLevelProvider>();
+                    logLevelProvider.UpdateFromRuntimeConfig(runtimeConfig);
+
+                    // Configure Telemetry
+                    // TODO: Issue #3239. Refactor this methods so that they are all called before creating the new logger factory.
+                    ConfigureApplicationInsightsTelemetry(app, runtimeConfig, logLevelInit);
+                    ConfigureOpenTelemetry(app, runtimeConfig, logLevelInit);
+                    ConfigureAzureLogAnalytics(app, runtimeConfig, logLevelInit);
+                    ConfigureFileSink(app, runtimeConfig, logLevelInit);
+
+                    //Flush all logs that were buffered before setting the LogLevel.
+                    // Important: All logs set before this point should use _logBuffer.
+                    FlushAllLogs(app);
+
+                    // Config provided before starting the engine.
+                    isRuntimeReady = PerformOnConfigChangeAsync(app).Result;
+
+                    if (!isRuntimeReady)
+                    {
+                        _logger.LogError(
+                            message: "Could not initialize the engine with the runtime config file: {configFilePath}",
+                            runtimeConfigProvider.ConfigFilePath);
+                        hostLifetime.StopApplication();
+                    }
+                }
+                else
+                {
+                    // Config provided during runtime.
+                    runtimeConfigProvider.IsLateConfigured = true;
+                    runtimeConfigProvider.RuntimeConfigLoadedHandlers.Add(async (_, _) =>
+                    {
+                        // This section will only run if the runtime config is provided during runtime. E.g. IsLateConfigured is true.
+                        // Set LogLevel based on RuntimeConfig
+                        RuntimeConfigProvider runtimeConfigProvider = app.ApplicationServices.GetService<RuntimeConfigProvider>()!;
+                        RuntimeConfig runtimeConfig = runtimeConfigProvider.GetConfig();
+                        DynamicLogLevelProvider logLevelProvider = app.ApplicationServices.GetRequiredService<DynamicLogLevelProvider>();
+                        logLevelProvider.UpdateFromRuntimeConfig(runtimeConfig);
+
+                        //Flush all logs that were buffered before setting the LogLevel.
+                        // Important: All logs set before this point should use _logBuffer.
+                        // This flush ensures that no logs are lost in the case of an IsLateConfigured scenario.
+                        FlushAllLogs(app);
+
+                        isRuntimeReady = await PerformOnConfigChangeAsync(app);
+
+                        return isRuntimeReady;
+                    });
                 }
             }
-            else
+            finally
             {
-                // Config provided during runtime.
-                runtimeConfigProvider.IsLateConfigured = true;
-                runtimeConfigProvider.RuntimeConfigLoadedHandlers.Add(async (_, _) =>
-                {
-                    isRuntimeReady = await PerformOnConfigChangeAsync(app);
-                    return isRuntimeReady;
-                });
+                // Attempt one final flush in case there was any exception that caused the
+                // previous section to throw an error before flushing the logs.
+                FlushAllLogs(app);
             }
 
             if (env.IsDevelopment())
@@ -604,6 +827,13 @@ namespace Azure.DataApiBuilder.Service
                     context => !(context.Request.Path.StartsWithSegments("/health") || context.Request.Path.StartsWithSegments("/graphql")),
                     appBuilder => appBuilder.UseHttpsRedirection()
                 );
+            }
+
+            // Response compression middleware should be placed early in the pipeline.
+            // Only use if compression is not set to None.
+            if (runtimeConfig?.Runtime?.Compression?.Level is not CompressionLevel.None)
+            {
+                app.UseResponseCompression();
             }
 
             // URL Rewrite middleware MUST be called prior to UseRouting().
@@ -689,23 +919,11 @@ namespace Azure.DataApiBuilder.Service
 
                 endpoints
                     .MapGraphQL()
-                    .WithOptions(new GraphQLServerOptions
+                    .WithOptions(options =>
                     {
-                        Tool = {
-                            // Determines if accessing the endpoint from a browser
-                            // will load the GraphQL Banana Cake Pop IDE.
-                            Enable = IsUIEnabled(runtimeConfig, env)
-                        }
-                    });
-
-                // In development mode, Nitro is enabled at /graphql endpoint by default.
-                // Need to disable mapping Nitro explicitly as well to avoid ability to query
-                // at an additional endpoint: /graphql/ui.
-                endpoints
-                    .MapNitroApp()
-                    .WithOptions(new GraphQLToolOptions
-                    {
-                        Enable = false
+                        // Determines if accessing the endpoint from a browser
+                        // will load the GraphQL Banana Cake Pop / Nitro IDE.
+                        options.Tool.Enable = IsUIEnabled(runtimeConfig, env);
                     });
 
                 endpoints.MapHealthChecks("/", new HealthCheckOptions
@@ -730,13 +948,28 @@ namespace Azure.DataApiBuilder.Service
         }
 
         /// <summary>
+        /// Registers a minimal valid GraphQL schema (a single placeholder field with a no-op
+        /// resolver) on the supplied <paramref name="schemaBuilder"/>. Used to satisfy Hot
+        /// Chocolate v16's eager schema validation when the real schema cannot be constructed
+        /// at startup (no runtime config loaded yet, or a config validation failure prevented
+        /// metadata provider initialization). The placeholder is unreachable in normal
+        /// operation: it is shadowed once a real config is hot-reloaded via the
+        /// <c>GRAPHQL_SCHEMA_EVICTION_ON_CONFIG_CHANGED</c> event.
+        /// </summary>
+        private static void EmitPlaceholderSchema(ISchemaBuilder schemaBuilder)
+        {
+            schemaBuilder.AddDocumentFromString("type Query { _dab: String }");
+            schemaBuilder.AddResolver("Query", "_dab", _ => null);
+        }
+
+        /// <summary>
         /// If LogLevel is NOT overridden by CLI, attempts to find the
         /// minimum log level based on host.mode in the runtime config if available.
         /// Creates a logger factory with the minimum log level.
         /// </summary>
         public static ILoggerFactory CreateLoggerFactoryForHostedAndNonHostedScenario(IServiceProvider serviceProvider, LogLevelInitializer logLevelInitializer)
         {
-            if (!IsLogLevelOverriddenByCli)
+            if (!IsCliOverriding)
             {
                 // If the log level is not overridden by command line arguments specified through CLI,
                 // attempt to get the runtime config to determine the loglevel based on host.mode.
@@ -768,7 +1001,7 @@ namespace Azure.DataApiBuilder.Service
             {
                 AuthenticationOptions authOptions = runtimeConfig.Runtime.Host.Authentication;
                 HostMode mode = runtimeConfig.Runtime.Host.Mode;
-                if (!authOptions.IsAuthenticationSimulatorEnabled() && !authOptions.IsEasyAuthAuthenticationProvider())
+                if (authOptions.IsJwtConfiguredIdentityProvider())
                 {
                     services.AddAuthentication(JwtBearerDefaults.AuthenticationScheme)
                     .AddJwtBearer(options =>
@@ -792,21 +1025,23 @@ namespace Azure.DataApiBuilder.Service
 
                     if (easyAuthType == EasyAuthType.AppService && !appServiceEnvironmentDetected)
                     {
-                        if (isProductionMode)
-                        {
-                            throw new DataApiBuilderException(
-                                message: AppServiceAuthenticationInfo.APPSERVICE_PROD_MISSING_ENV_CONFIG,
-                                statusCode: System.Net.HttpStatusCode.ServiceUnavailable,
-                                subStatusCode: DataApiBuilderException.SubStatusCodes.ErrorInInitialization);
-                        }
-                        else
-                        {
-                            _logger.LogWarning(AppServiceAuthenticationInfo.APPSERVICE_DEV_MISSING_ENV_CONFIG);
-                        }
+                        _logBuffer.BufferLog(LogLevel.Warning, AppServiceAuthenticationInfo.APPSERVICE_DEV_MISSING_ENV_CONFIG);
                     }
 
-                    services.AddAuthentication(EasyAuthAuthenticationDefaults.AUTHENTICATIONSCHEME)
-                        .AddEasyAuthAuthentication(easyAuthAuthenticationProvider: easyAuthType);
+                    string defaultScheme = easyAuthType == EasyAuthType.AppService
+                        ? EasyAuthAuthenticationDefaults.APPSERVICEAUTHSCHEME
+                        : EasyAuthAuthenticationDefaults.SWAAUTHSCHEME;
+
+                    services.AddAuthentication(defaultScheme)
+                            .AddEnvDetectedEasyAuth();
+
+                    _logBuffer.BufferLog(LogLevel.Information, $"Registered EasyAuth scheme: {defaultScheme}");
+
+                }
+                else if (authOptions.IsUnauthenticatedAuthenticationProvider())
+                {
+                    services.AddAuthentication(UnauthenticatedAuthenticationDefaults.AUTHENTICATIONSCHEME)
+                        .AddUnauthenticatedAuthentication();
                 }
                 else if (mode == HostMode.Development && authOptions.IsAuthenticationSimulatorEnabled())
                 {
@@ -827,7 +1062,7 @@ namespace Azure.DataApiBuilder.Service
             {
                 // Sets EasyAuth as the default authentication scheme when runtime configuration
                 // is not present.
-                SetStaticWebAppsAuthentication(services);
+                SetAppServiceAuthentication(services);
             }
         }
 
@@ -849,7 +1084,8 @@ namespace Azure.DataApiBuilder.Service
             services.AddAuthentication()
                     .AddEnvDetectedEasyAuth()
                     .AddJwtBearer()
-                    .AddSimulatorAuthentication();
+                    .AddSimulatorAuthentication()
+                    .AddUnauthenticatedAuthentication();
         }
 
         /// <summary>
@@ -859,7 +1095,7 @@ namespace Azure.DataApiBuilder.Service
         /// <param name="app">The application builder.</param>
         /// <param name="runtimeConfig">The provider used to load runtime configuration.</param>
         /// <seealso cref="https://docs.microsoft.com/en-us/azure/azure-monitor/app/asp-net-core#enable-application-insights-telemetry-collection"/>
-        private void ConfigureApplicationInsightsTelemetry(IApplicationBuilder app, RuntimeConfig runtimeConfig)
+        private void ConfigureApplicationInsightsTelemetry(IApplicationBuilder app, RuntimeConfig runtimeConfig, LogLevelInitializer logLevelInit)
         {
             if (runtimeConfig?.Runtime?.Telemetry is not null
                 && runtimeConfig.Runtime.Telemetry.ApplicationInsights is not null)
@@ -868,13 +1104,13 @@ namespace Azure.DataApiBuilder.Service
 
                 if (!AppInsightsOptions.Enabled)
                 {
-                    _logger.LogInformation("Application Insights are disabled.");
+                    _logBuffer.BufferLog(LogLevel.Information, "Application Insights are disabled.");
                     return;
                 }
 
                 if (string.IsNullOrWhiteSpace(AppInsightsOptions.ConnectionString))
                 {
-                    _logger.LogWarning("Logs won't be sent to Application Insights because an Application Insights connection string is not available in the runtime config.");
+                    _logBuffer.BufferLog(LogLevel.Warning, "Logs won't be sent to Application Insights because an Application Insights connection string is not available in the runtime config.");
                     return;
                 }
 
@@ -882,7 +1118,7 @@ namespace Azure.DataApiBuilder.Service
 
                 if (appTelemetryClient is null)
                 {
-                    _logger.LogError("Telemetry client is not initialized.");
+                    _logBuffer.BufferLog(LogLevel.Error, "Telemetry client is not initialized.");
                     return;
                 }
 
@@ -897,7 +1133,7 @@ namespace Azure.DataApiBuilder.Service
                 }
 
                 // Updating Startup Logger to Log from Startup Class.
-                ILoggerFactory loggerFactory = Program.GetLoggerFactoryForLogLevel(MinimumLogLevel, appTelemetryClient);
+                ILoggerFactory? loggerFactory = CreateLoggerFactoryForHostedAndNonHostedScenario(app.ApplicationServices, logLevelInit);
                 _logger = loggerFactory.CreateLogger<Startup>();
             }
         }
@@ -907,7 +1143,7 @@ namespace Azure.DataApiBuilder.Service
         /// is enabled, we can track different events and metrics.
         /// </summary>
         /// <param name="runtimeConfigurationProvider">The provider used to load runtime configuration.</param>
-        private void ConfigureOpenTelemetry(RuntimeConfig runtimeConfig)
+        private void ConfigureOpenTelemetry(IApplicationBuilder app, RuntimeConfig runtimeConfig, LogLevelInitializer logLevelInit)
         {
             if (runtimeConfig?.Runtime?.Telemetry is not null
                 && runtimeConfig.Runtime.Telemetry.OpenTelemetry is not null)
@@ -916,18 +1152,19 @@ namespace Azure.DataApiBuilder.Service
 
                 if (!OpenTelemetryOptions.Enabled)
                 {
-                    _logger.LogInformation("Open Telemetry is disabled.");
+                    _logBuffer.BufferLog(LogLevel.Information, "Open Telemetry is disabled.");
                     return;
                 }
 
-                if (string.IsNullOrWhiteSpace(OpenTelemetryOptions?.Endpoint))
+                if (string.IsNullOrWhiteSpace(OpenTelemetryOptions?.Endpoint)
+                    || !Uri.TryCreate(OpenTelemetryOptions.Endpoint, UriKind.Absolute, out _))
                 {
-                    _logger.LogWarning("Logs won't be sent to Open Telemetry because an Open Telemetry connection string is not available in the runtime config.");
+                    _logBuffer.BufferLog(LogLevel.Warning, "Logs won't be sent to Open Telemetry because a valid Open Telemetry endpoint URI is not available in the runtime config.");
                     return;
                 }
 
                 // Updating Startup Logger to Log from Startup Class.
-                ILoggerFactory? loggerFactory = Program.GetLoggerFactoryForLogLevel(MinimumLogLevel);
+                ILoggerFactory? loggerFactory = CreateLoggerFactoryForHostedAndNonHostedScenario(app.ApplicationServices, logLevelInit);
                 _logger = loggerFactory.CreateLogger<Startup>();
             }
         }
@@ -937,7 +1174,7 @@ namespace Azure.DataApiBuilder.Service
         /// is enabled, we can track different events and metrics.
         /// </summary>
         /// <param name="runtimeConfigurationProvider">The provider used to load runtime configuration.</param>
-        private void ConfigureAzureLogAnalytics(RuntimeConfig runtimeConfig)
+        private void ConfigureAzureLogAnalytics(IApplicationBuilder app, RuntimeConfig runtimeConfig, LogLevelInitializer logLevelInit)
         {
             if (runtimeConfig?.Runtime?.Telemetry is not null
                 && runtimeConfig.Runtime.Telemetry.AzureLogAnalytics is not null)
@@ -946,26 +1183,26 @@ namespace Azure.DataApiBuilder.Service
 
                 if (!AzureLogAnalyticsOptions.Enabled)
                 {
-                    _logger.LogInformation("Azure Log Analytics is disabled.");
+                    _logBuffer.BufferLog(LogLevel.Information, "Azure Log Analytics is disabled.");
                     return;
                 }
 
                 bool isAuthIncomplete = false;
                 if (string.IsNullOrEmpty(AzureLogAnalyticsOptions.Auth?.CustomTableName))
                 {
-                    _logger.LogError("Logs won't be sent to Azure Log Analytics because the Custom Table Name is not available in the config file.");
+                    _logBuffer.BufferLog(LogLevel.Error, "Logs won't be sent to Azure Log Analytics because the Custom Table Name is not available in the config file.");
                     isAuthIncomplete = true;
                 }
 
                 if (string.IsNullOrEmpty(AzureLogAnalyticsOptions.Auth?.DcrImmutableId))
                 {
-                    _logger.LogError("Logs won't be sent to Azure Log Analytics because the DCR Immutable Id is not available in the config file.");
+                    _logBuffer.BufferLog(LogLevel.Error, "Logs won't be sent to Azure Log Analytics because the DCR Immutable Id is not available in the config file.");
                     isAuthIncomplete = true;
                 }
 
                 if (string.IsNullOrEmpty(AzureLogAnalyticsOptions.Auth?.DceEndpoint))
                 {
-                    _logger.LogError("Logs won't be sent to Azure Log Analytics because the DCE Endpoint is not available in the config file.");
+                    _logBuffer.BufferLog(LogLevel.Error, "Logs won't be sent to Azure Log Analytics because the DCE Endpoint is not available in the config file.");
                     isAuthIncomplete = true;
                 }
 
@@ -975,7 +1212,7 @@ namespace Azure.DataApiBuilder.Service
                 }
 
                 // Updating Startup Logger to Log from Startup Class.
-                ILoggerFactory? loggerFactory = Program.GetLoggerFactoryForLogLevel(MinimumLogLevel);
+                ILoggerFactory? loggerFactory = CreateLoggerFactoryForHostedAndNonHostedScenario(app.ApplicationServices, logLevelInit);
                 _logger = loggerFactory.CreateLogger<Startup>();
             }
         }
@@ -986,7 +1223,7 @@ namespace Azure.DataApiBuilder.Service
         /// </summary>
         /// <param name="app">The application builder.</param>
         /// <param name="runtimeConfig">The provider used to load runtime configuration.</param>
-        private void ConfigureFileSink(IApplicationBuilder app, RuntimeConfig runtimeConfig)
+        private void ConfigureFileSink(IApplicationBuilder app, RuntimeConfig runtimeConfig, LogLevelInitializer logLevelInit)
         {
             if (runtimeConfig?.Runtime?.Telemetry is not null
                && runtimeConfig.Runtime.Telemetry.File is not null)
@@ -995,37 +1232,37 @@ namespace Azure.DataApiBuilder.Service
 
                 if (!FileSinkOptions.Enabled)
                 {
-                    _logger.LogInformation("File is disabled.");
+                    _logBuffer.BufferLog(LogLevel.Information, "File is disabled.");
                     return;
                 }
 
                 if (string.IsNullOrWhiteSpace(FileSinkOptions.Path))
                 {
-                    _logger.LogError("Logs won't be sent to File because the Path is not available in the config file.");
+                    _logBuffer.BufferLog(LogLevel.Error, "Logs won't be sent to File because the Path is not available in the config file.");
                     return;
                 }
 
                 Logger? serilogLogger = app.ApplicationServices.GetService<Logger>();
                 if (serilogLogger is null)
                 {
-                    _logger.LogError("Serilog Logger Configuration is not set.");
+                    _logBuffer.BufferLog(LogLevel.Error, "Serilog Logger Configuration is not set.");
                     return;
                 }
 
                 // Updating Startup Logger to Log from Startup Class.
-                ILoggerFactory? loggerFactory = Program.GetLoggerFactoryForLogLevel(logLevel: MinimumLogLevel, serilogLogger: serilogLogger);
+                ILoggerFactory? loggerFactory = CreateLoggerFactoryForHostedAndNonHostedScenario(app.ApplicationServices, logLevelInit);
                 _logger = loggerFactory.CreateLogger<Startup>();
             }
         }
 
         /// <summary>
-        /// Sets Static Web Apps EasyAuth as the authentication scheme for the engine.
+        /// Sets App Service EasyAuth as the authentication scheme for the engine.
         /// </summary>
         /// <param name="services">The service collection where authentication services are added.</param>
-        private static void SetStaticWebAppsAuthentication(IServiceCollection services)
+        private static void SetAppServiceAuthentication(IServiceCollection services)
         {
-            services.AddAuthentication(EasyAuthAuthenticationDefaults.AUTHENTICATIONSCHEME)
-                    .AddEasyAuthAuthentication(EasyAuthType.StaticWebApps);
+            services.AddAuthentication(EasyAuthAuthenticationDefaults.APPSERVICEAUTHSCHEME)
+                .AddEnvDetectedEasyAuth();
         }
 
         /// <summary>
@@ -1046,12 +1283,6 @@ namespace Azure.DataApiBuilder.Service
                 // itself.
 
                 runtimeConfigValidator.ValidateConfigProperties();
-
-                if (runtimeConfig.IsDevelopmentMode())
-                {
-                    // Running only in developer mode to ensure fast and smooth startup in production.
-                    runtimeConfigValidator.ValidatePermissionsInConfig(runtimeConfig);
-                }
 
                 IMetadataProviderFactory sqlMetadataProviderFactory =
                     app.ApplicationServices.GetRequiredService<IMetadataProviderFactory>();
@@ -1147,10 +1378,47 @@ namespace Azure.DataApiBuilder.Service
         }
 
         /// <summary>
+        /// Checks whether On-Behalf-Of (OBO) authentication is configured by verifying that
+        /// the required environment variables are set and the config has user-delegated auth enabled.
+        /// </summary>
+        /// <returns>True if OBO is configured and ready to use; otherwise, false.</returns>
+        private bool IsOboConfigured()
+        {
+            // Check required environment variables first (fast path)
+            string? clientId = Environment.GetEnvironmentVariable(UserDelegatedAuthOptions.DAB_OBO_CLIENT_ID_ENV_VAR);
+            string? tenantId = Environment.GetEnvironmentVariable(UserDelegatedAuthOptions.DAB_OBO_TENANT_ID_ENV_VAR);
+            string? clientSecret = Environment.GetEnvironmentVariable(UserDelegatedAuthOptions.DAB_OBO_CLIENT_SECRET_ENV_VAR);
+
+            if (string.IsNullOrEmpty(clientId) || string.IsNullOrEmpty(tenantId) || string.IsNullOrEmpty(clientSecret))
+            {
+                return false;
+            }
+
+            // Check if any data source has user-delegated auth enabled
+            RuntimeConfig? config = _configProvider?.TryGetConfig(out RuntimeConfig? c) == true ? c : null;
+            if (config is null)
+            {
+                return false;
+            }
+
+            foreach (DataSource ds in config.ListAllDataSources())
+            {
+                if (ds.IsUserDelegatedAuthEnabled &&
+                    !string.IsNullOrEmpty(ds.UserDelegatedAuth!.DatabaseAudience))
+                {
+                    return true;
+                }
+            }
+
+            return false;
+        }
+
+        /// <summary>
         /// Adds all of the class namespaces that have loggers that the user is able to change
         /// </summary>
         public static void AddValidFilters()
         {
+            LoggerFilters.AddFilter(typeof(Startup).FullName);
             LoggerFilters.AddFilter(typeof(RuntimeConfigValidator).FullName);
             LoggerFilters.AddFilter(typeof(SqlQueryEngine).FullName);
             LoggerFilters.AddFilter(typeof(IQueryExecutor).FullName);
@@ -1162,6 +1430,7 @@ namespace Azure.DataApiBuilder.Service
             LoggerFilters.AddFilter(typeof(ConfigurationController).FullName);
             LoggerFilters.AddFilter(typeof(IAuthorizationHandler).FullName);
             LoggerFilters.AddFilter(typeof(IAuthorizationResolver).FullName);
+            LoggerFilters.AddFilter(typeof(FileSystemRuntimeConfigLoader).FullName);
             LoggerFilters.AddFilter("default");
         }
 
@@ -1175,6 +1444,29 @@ namespace Azure.DataApiBuilder.Service
                 && !string.IsNullOrWhiteSpace(azureLogAnalyticsOptions.Auth.CustomTableName)
                 && !string.IsNullOrWhiteSpace(azureLogAnalyticsOptions.Auth.DcrImmutableId)
                 && !string.IsNullOrWhiteSpace(azureLogAnalyticsOptions.Auth.DceEndpoint);
+        }
+
+        /// <summary>
+        /// Helper function that sets the logger for FileSystemRuntimeConfigLoader and flushes the buffered logs to the logger.
+        /// </summary>
+        /// <param name="app">Contains all the services needed to set the logger.</param>
+        private void FlushAllLogs(IApplicationBuilder app)
+        {
+            try
+            {
+                FileSystemRuntimeConfigLoader configLoader = app.ApplicationServices.GetRequiredService<FileSystemRuntimeConfigLoader>();
+                configLoader.SetLogger(app.ApplicationServices.GetRequiredService<ILogger<FileSystemRuntimeConfigLoader>>());
+
+                _logBuffer.FlushToLogger(_logger);
+                configLoader.FlushLogBuffer();
+            }
+            catch (Exception ex)
+            {
+                throw new DataApiBuilderException(
+                    message: ex.Message,
+                    statusCode: System.Net.HttpStatusCode.ServiceUnavailable,
+                    subStatusCode: DataApiBuilderException.SubStatusCodes.ErrorInInitialization);
+            }
         }
     }
 }

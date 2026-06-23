@@ -49,6 +49,19 @@ public class RuntimeConfigValidator : IConfigValidator
         DatabaseType.DWSQL
     ];
 
+    // Error messages for user-delegated authentication configuration.
+    public const string USER_DELEGATED_AUTH_DATABASE_TYPE_ERR_MSG =
+        "User-delegated authentication is only supported when data-source.database-type is 'mssql'.";
+
+    public const string USER_DELEGATED_AUTH_MISSING_AUDIENCE_ERR_MSG =
+        "data-source.user-delegated-auth.database-audience must be set when user-delegated-auth is configured.";
+
+    public const string USER_DELEGATED_AUTH_CACHING_ERR_MSG =
+        "runtime.cache.enabled must be false when user-delegated-auth is configured.";
+
+    public const string USER_DELEGATED_AUTH_MISSING_CREDENTIALS_ERR_MSG =
+        "User-delegated authentication requires DAB_OBO_CLIENT_ID, DAB_OBO_TENANT_ID, and DAB_OBO_CLIENT_SECRET environment variables.";
+
     // Error messages.
     public const string INVALID_CLAIMS_IN_POLICY_ERR_MSG = "One or more claim types supplied in the database policy are not supported.";
 
@@ -83,18 +96,6 @@ public class RuntimeConfigValidator : IConfigValidator
         ValidateLoggerFilters(runtimeConfig);
         ValidateAzureLogAnalyticsAuth(runtimeConfig);
         ValidateFileSinkPath(runtimeConfig);
-
-        // Running these graphQL validations only in development mode to ensure
-        // fast startup of engine in production mode.
-        if (runtimeConfig.IsDevelopmentMode())
-        {
-            ValidateEntityConfiguration(runtimeConfig);
-
-            if (runtimeConfig.IsGraphQLEnabled)
-            {
-                ValidateEntitiesDoNotGenerateDuplicateQueriesOrMutation(runtimeConfig.DataSource.DatabaseType, runtimeConfig.Entities);
-            }
-        }
     }
 
     /// <summary>
@@ -119,6 +120,68 @@ public class RuntimeConfigValidator : IConfigValidator
         }
 
         ValidateDatabaseType(runtimeConfig, fileSystem, logger);
+
+        ValidateUserDelegatedAuthOptions(runtimeConfig);
+    }
+
+    /// <summary>
+    /// Validates configuration for user-delegated authentication (OBO).
+    /// When any data source has user-delegated-auth configured, the following
+    /// rules are enforced:
+    /// - data-source.database-type must be "mssql".
+    /// - data-source.user-delegated-auth.database-audience must be present.
+    /// - runtime.cache.enabled must be false.
+    /// - Environment variables DAB_OBO_CLIENT_ID, DAB_OBO_TENANT_ID, and DAB_OBO_CLIENT_SECRET must be set.
+    /// </summary>
+    /// <param name="runtimeConfig">Runtime configuration.</param>
+    private void ValidateUserDelegatedAuthOptions(RuntimeConfig runtimeConfig)
+    {
+        foreach (DataSource dataSource in runtimeConfig.ListAllDataSources())
+        {
+            // Skip validation if user-delegated-auth is not configured or not enabled
+            if (dataSource.UserDelegatedAuth is null || !dataSource.UserDelegatedAuth.Enabled)
+            {
+                continue;
+            }
+
+            if (dataSource.DatabaseType != DatabaseType.MSSQL)
+            {
+                HandleOrRecordException(new DataApiBuilderException(
+                    message: USER_DELEGATED_AUTH_DATABASE_TYPE_ERR_MSG,
+                    statusCode: HttpStatusCode.ServiceUnavailable,
+                    subStatusCode: DataApiBuilderException.SubStatusCodes.ConfigValidationError));
+            }
+
+            if (string.IsNullOrWhiteSpace(dataSource.UserDelegatedAuth.DatabaseAudience))
+            {
+                HandleOrRecordException(new DataApiBuilderException(
+                    message: USER_DELEGATED_AUTH_MISSING_AUDIENCE_ERR_MSG,
+                    statusCode: HttpStatusCode.ServiceUnavailable,
+                    subStatusCode: DataApiBuilderException.SubStatusCodes.ConfigValidationError));
+            }
+
+            // Validate OBO App Registration credentials are configured via environment variables.
+            string? clientId = Environment.GetEnvironmentVariable(UserDelegatedAuthOptions.DAB_OBO_CLIENT_ID_ENV_VAR);
+            string? tenantId = Environment.GetEnvironmentVariable(UserDelegatedAuthOptions.DAB_OBO_TENANT_ID_ENV_VAR);
+            string? clientSecret = Environment.GetEnvironmentVariable(UserDelegatedAuthOptions.DAB_OBO_CLIENT_SECRET_ENV_VAR);
+
+            if (string.IsNullOrWhiteSpace(clientId) || string.IsNullOrWhiteSpace(tenantId) || string.IsNullOrWhiteSpace(clientSecret))
+            {
+                HandleOrRecordException(new DataApiBuilderException(
+                    message: USER_DELEGATED_AUTH_MISSING_CREDENTIALS_ERR_MSG,
+                    statusCode: HttpStatusCode.ServiceUnavailable,
+                    subStatusCode: DataApiBuilderException.SubStatusCodes.ConfigValidationError));
+            }
+
+            // Validate caching is disabled when user-delegated-auth is enabled
+            if (runtimeConfig.Runtime?.Cache?.Enabled == true)
+            {
+                HandleOrRecordException(new DataApiBuilderException(
+                    message: USER_DELEGATED_AUTH_CACHING_ERR_MSG,
+                    statusCode: HttpStatusCode.ServiceUnavailable,
+                    subStatusCode: DataApiBuilderException.SubStatusCodes.ConfigValidationError));
+            }
+        }
     }
 
     /// <summary>
@@ -259,7 +322,25 @@ public class RuntimeConfigValidator : IConfigValidator
 
         _logger.LogInformation("Validating entity relationships.");
         ValidateRelationshipConfigCorrectness(runtimeConfig);
+
+        // This function initializes the metadata providers which in turn validates the connectivity to the
+        // database and also validates all the REST and GraphQL paths as well as the permissions of the entities
+        // that are created from the 'Entities' and 'Autoentities' configuration, including the relationships defined in the config against the database metadata.
+        // Any exceptions caught during this process are added to the ConfigValidationExceptions list and logged at the end of this function.
         await ValidateEntitiesMetadata(runtimeConfig, loggerFactory);
+
+        // Validate entity configuration (root vs non-root rules, entity counts) after autoentity resolution.
+        // Only run when there are no connection string errors, since autoentity resolution requires DB access.
+        if (!ConfigValidationExceptions.Any(x => x.Message.StartsWith(DataApiBuilderException.CONNECTION_STRING_ERROR_MESSAGE)))
+        {
+            // Re-read the config since autoentity resolution may have added new entities.
+            if (_runtimeConfigProvider.TryGetConfig(out RuntimeConfig? updatedConfig) && updatedConfig is not null)
+            {
+                runtimeConfig = updatedConfig;
+            }
+
+            ValidateDataSourceAndEntityPresence(runtimeConfig);
+        }
 
         if (validationResult.IsValid && !ConfigValidationExceptions.Any())
         {
@@ -411,6 +492,8 @@ public class RuntimeConfigValidator : IConfigValidator
     /// This method validates the entities relationships against the database objects using
     /// metadata from the backend DB generated by this function.
     /// </summary>
+    /// NOTE: This function should not be used in the regular flow of DAB as we already initialize the metadata providers during startup,
+    /// doing it again will cause the application to fail as it will try to add data that is already present.
     public async Task ValidateEntitiesMetadata(RuntimeConfig runtimeConfig, ILoggerFactory loggerFactory)
     {
         // Only used for validation so we don't need the handler which is for hot reload scenarios.
@@ -424,6 +507,7 @@ public class RuntimeConfigValidator : IConfigValidator
         // Only used for validation so we don't need the handler which is for hot reload scenarios.
         MetadataProviderFactory metadataProviderFactory = new(
             runtimeConfigProvider: _runtimeConfigProvider,
+            runtimeConfigValidator: this,
             queryManagerFactory: queryManagerFactory,
             logger: loggerFactory.CreateLogger<ISqlMetadataProvider>(),
             fileSystem: _fileSystem,
@@ -437,6 +521,143 @@ public class RuntimeConfigValidator : IConfigValidator
         if (!ConfigValidationExceptions.Any(x => x.Message.StartsWith(DataApiBuilderException.CONNECTION_STRING_ERROR_MESSAGE)))
         {
             ValidateRelationships(runtimeConfig, metadataProviderFactory);
+        }
+    }
+
+    /// <summary>
+    /// Validates entity and data source configuration based on whether the config is a root or not.
+    ///
+    /// Root config (top-level with children via data-source-files):
+    ///   - Does not need a data source (children provide their own)
+    ///   - Must NOT have entities if it has no data source (entities need a data source)
+    ///   - If it HAS a data source, normal entity rules apply (must have at least 1 entity)
+    ///   - Each child is validated independently
+    ///
+    /// Non-root config (standalone or child):
+    ///   - Must have a data source
+    ///   - Must have at least 1 real entity (manual or resolved from autoentities)
+    ///   - If autoentities property exists but discovers no entities, warn
+    ///   - If autoentities discovers no entities but manual entities exist, warn (not error)
+    ///   - If neither manual entities nor autoentity discoveries produce any entities, error
+    ///
+    /// This method should be called after autoentity resolution so that resolved entity counts are available.
+    /// It should be gated on no database connection errors.
+    /// </summary>
+    public void ValidateDataSourceAndEntityPresence(RuntimeConfig runtimeConfig)
+    {
+        if (runtimeConfig.IsRootConfig)
+        {
+            ValidateRootConfig(runtimeConfig);
+        }
+        else
+        {
+            ValidateNonRootConfig(runtimeConfig, configName: null);
+        }
+    }
+
+    /// <summary>
+    /// Validates a root config (top-level with children).
+    /// If the root has a data source, it must have entities (same as non-root).
+    /// If the root has no data source, it must NOT have entities or autoentities (they'd have no data source).
+    /// Each child config is validated independently.
+    /// </summary>
+    private void ValidateRootConfig(RuntimeConfig runtimeConfig)
+    {
+        bool hasDataSource = runtimeConfig.DataSource is not null;
+        bool hasEntities = runtimeConfig.Entities.Entities.Count > 0;
+        bool hasAutoentities = runtimeConfig.Autoentities.Autoentities.Count > 0;
+
+        if (hasDataSource)
+        {
+            // Root with its own data source follows normal entity rules.
+            ValidateEntityPresence(runtimeConfig, configName: null);
+        }
+        else if (hasEntities || hasAutoentities)
+        {
+            // Root without a data source but with entities/autoentities — invalid.
+            HandleOrRecordException(new DataApiBuilderException(
+                message: "Entities or autoentities are defined in the root config but no data source is configured. " +
+                    "A root config without a data source must not define entities or autoentities.",
+                statusCode: HttpStatusCode.ServiceUnavailable,
+                subStatusCode: DataApiBuilderException.SubStatusCodes.ConfigValidationError));
+        }
+
+        // Validate each child config independently.
+        foreach ((string fileName, RuntimeConfig childConfig) in runtimeConfig.ChildConfigs)
+        {
+            ValidateNonRootConfig(childConfig, configName: fileName);
+        }
+    }
+
+    /// <summary>
+    /// Validates a non-root config (standalone or child).
+    /// Must have a data source. Must have at least 1 real entity.
+    /// </summary>
+    /// <param name="config">The config to validate.</param>
+    /// <param name="configName">Filename for error context (null for top-level standalone).</param>
+    private void ValidateNonRootConfig(RuntimeConfig config, string? configName)
+    {
+        string prefix = configName is not null ? $"Config '{configName}': " : string.Empty;
+
+        if (config.DataSource is null)
+        {
+            HandleOrRecordException(new DataApiBuilderException(
+                message: $"{prefix}A data source is required.",
+                statusCode: HttpStatusCode.ServiceUnavailable,
+                subStatusCode: DataApiBuilderException.SubStatusCodes.ConfigValidationError));
+            return;
+        }
+
+        ValidateEntityPresence(config, configName);
+    }
+
+    /// <summary>
+    /// Validates that a config with a data source has at least 1 real entity.
+    ///
+    /// Rules:
+    /// - If the autoentities property exists (even if empty/no definitions) and no entities
+    ///   were discovered through it, warn.
+    /// - If total real entities (manual + discovered) is 0, error.
+    /// - If manual entities exist but autoentities discovered nothing, warn (not error).
+    /// </summary>
+    /// <param name="config">The config to validate (must have a data source).</param>
+    /// <param name="configName">Filename for error context (null for top-level).</param>
+    private void ValidateEntityPresence(RuntimeConfig config, string? configName)
+    {
+        string prefix = configName is not null ? $"Config '{configName}': " : string.Empty;
+
+        // Check autoentities: if the property exists, report on discovery results.
+        bool autoentitiesPropertyExists = config.Autoentities.Autoentities.Count > 0;
+        int resolvedAutoentityCount = 0;
+
+        if (autoentitiesPropertyExists)
+        {
+            foreach (KeyValuePair<string, Autoentity> autoentityDef in config.Autoentities)
+            {
+                if (config.AutoentityResolutionCounts.TryGetValue(autoentityDef.Key, out int resolvedCount))
+                {
+                    resolvedAutoentityCount += resolvedCount;
+                }
+            }
+        }
+
+        // Count total real entities: manual entities + resolved autoentities.
+        int totalEntityCount = config.Entities.Entities.Count + resolvedAutoentityCount;
+
+        if (totalEntityCount == 0)
+        {
+            // Error — nothing to serve. Don't also warn about autoentities; the error covers it.
+            HandleOrRecordException(new DataApiBuilderException(
+                message: $"{prefix}No entities found. At least one entity must be defined or discovered " +
+                    "from autoentities when a data source is configured.",
+                statusCode: HttpStatusCode.ServiceUnavailable,
+                subStatusCode: DataApiBuilderException.SubStatusCodes.ConfigValidationError));
+        }
+        else if (autoentitiesPropertyExists && resolvedAutoentityCount == 0)
+        {
+            // Manual entities exist so we're not erroring, but autoentities discovered nothing — warn.
+            _logger.LogWarning("{prefix}Autoentities are configured but no entities were discovered. " +
+                "Verify that autoentity patterns match database objects.", prefix);
         }
     }
 
@@ -656,6 +877,7 @@ public class RuntimeConfigValidator : IConfigValidator
     /// <summary>
     /// Helper method to validate that the rest path property for the entity is correctly configured.
     /// The rest path should not be null/empty and should not contain any reserved characters.
+    /// Allows sub-directories (forward slashes) in the path.
     /// </summary>
     /// <param name="entityName">Name of the entity.</param>
     /// <param name="pathForEntity">The rest path for the entity.</param>
@@ -672,10 +894,10 @@ public class RuntimeConfigValidator : IConfigValidator
                 );
         }
 
-        if (RuntimeConfigValidatorUtil.DoesUriComponentContainReservedChars(pathForEntity))
+        if (!RuntimeConfigValidatorUtil.TryValidateEntityRestPath(pathForEntity, out string? errorMessage))
         {
             throw new DataApiBuilderException(
-                message: $"The rest path: {pathForEntity} for entity: {entityName} contains one or more reserved characters.",
+                message: $"The rest path: {pathForEntity} for entity: {entityName} {errorMessage ?? "contains invalid characters."}",
                 statusCode: HttpStatusCode.ServiceUnavailable,
                 subStatusCode: DataApiBuilderException.SubStatusCodes.ConfigValidationError
                 );
@@ -838,6 +1060,17 @@ public class RuntimeConfigValidator : IConfigValidator
                 statusCode: HttpStatusCode.ServiceUnavailable,
                 subStatusCode: DataApiBuilderException.SubStatusCodes.ConfigValidationError));
         }
+
+        // Validate aggregate-records query-timeout if provided
+        if (runtimeConfig.Runtime.Mcp.DmlTools?.AggregateRecordsQueryTimeout is not null &&
+            (runtimeConfig.Runtime.Mcp.DmlTools.AggregateRecordsQueryTimeout < 1 || runtimeConfig.Runtime.Mcp.DmlTools.AggregateRecordsQueryTimeout > DmlToolsConfig.MAX_QUERY_TIMEOUT_SECONDS))
+        {
+            HandleOrRecordException(new DataApiBuilderException(
+                message: $"Aggregate-records query-timeout must be between 1 and {DmlToolsConfig.MAX_QUERY_TIMEOUT_SECONDS} seconds. " +
+                         $"Provided value: {runtimeConfig.Runtime.Mcp.DmlTools.AggregateRecordsQueryTimeout}.",
+                statusCode: HttpStatusCode.ServiceUnavailable,
+                subStatusCode: DataApiBuilderException.SubStatusCodes.ConfigValidationError));
+        }
     }
 
     private void ValidateAuthenticationOptions(RuntimeConfig runtimeConfig)
@@ -846,6 +1079,14 @@ public class RuntimeConfigValidator : IConfigValidator
         if (runtimeConfig.Runtime?.Host?.Authentication is null)
         {
             return;
+        }
+
+        // Warn if the configured EasyAuth provider is StaticWebApps (deprecated)
+        if (!string.IsNullOrWhiteSpace(runtimeConfig.Runtime.Host.Authentication.Provider) &&
+            Enum.TryParse<EasyAuthType>(runtimeConfig.Runtime.Host.Authentication.Provider, ignoreCase: true, out EasyAuthType provider) &&
+            provider == EasyAuthType.StaticWebApps)
+        {
+            _logger.LogWarning("The 'StaticWebApps' authentication provider is deprecated.");
         }
 
         bool isAudienceSet = !string.IsNullOrEmpty(runtimeConfig.Runtime.Host.Authentication.Jwt?.Audience);
@@ -1494,7 +1735,7 @@ public class RuntimeConfigValidator : IConfigValidator
             {
                 for (int j = 0; j < loggerSub.Length; j++)
                 {
-                    if (!loggerSub[j].Equals(validFiltersSub[j]))
+                    if (!loggerSub[j].Equals(validFiltersSub[j], StringComparison.OrdinalIgnoreCase))
                     {
                         isValid = false;
                         break;
@@ -1509,5 +1750,27 @@ public class RuntimeConfigValidator : IConfigValidator
         }
 
         return false;
+    }
+
+    /// <summary>
+    /// Checks that all of the entities created with the Entities and Autoentities properties
+    /// are valid by having unique paths for both REST and GraphQL, that there are no duplicate
+    /// Queries or Mutation entities, and ensure the semantic correctness of all the entities.
+    /// </summary>
+    /// <param name="runtimeConfig">The runtime configuration.</param>
+    public void ValidateEntityAndAutoentityConfigurations(RuntimeConfig runtimeConfig)
+    {
+        if (runtimeConfig.IsDevelopmentMode())
+        {
+            ValidateEntityConfiguration(runtimeConfig);
+
+            if (runtimeConfig.IsGraphQLEnabled && runtimeConfig.DataSource is not null)
+            {
+                ValidateEntitiesDoNotGenerateDuplicateQueriesOrMutation(runtimeConfig.DataSource.DatabaseType, runtimeConfig.Entities);
+            }
+
+            // Running only in developer mode to ensure fast and smooth startup in production.
+            ValidatePermissionsInConfig(runtimeConfig);
+        }
     }
 }

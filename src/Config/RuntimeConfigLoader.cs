@@ -13,7 +13,6 @@ using Azure.DataApiBuilder.Config.ObjectModel;
 using Azure.DataApiBuilder.Product;
 using Azure.DataApiBuilder.Service.Exceptions;
 using Microsoft.Data.SqlClient;
-using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Primitives;
 using Npgsql;
 using static Azure.DataApiBuilder.Config.DabConfigEvents;
@@ -26,6 +25,8 @@ public abstract class RuntimeConfigLoader
     private DabChangeToken _changeToken;
     private HotReloadEventHandler<HotReloadEventArgs>? _handler;
     protected readonly string? _connectionString;
+
+    protected static LogBuffer _logBuffer = new();
 
     // Public to allow the RuntimeProvider and other users of class to set via out param.
     // May be candidate to refactor by changing all of the Parse/Load functions to save
@@ -130,24 +131,103 @@ public abstract class RuntimeConfigLoader
     public abstract string GetPublishedDraftSchemaLink();
 
     /// <summary>
+    /// Extracts AzureKeyVaultOptions from JSON string with configurable variable replacement.
+    /// </summary>
+    /// <param name="json">JSON that represents the config file.</param>
+    /// <param name="enableEnvReplacement">Whether to enable environment variable replacement during extraction.</param>
+    /// <param name="replacementFailureMode">Failure mode for environment variable replacement if enabled.</param>
+    /// <returns>AzureKeyVaultOptions if present, null otherwise.</returns>
+    private static AzureKeyVaultOptions? ExtractAzureKeyVaultOptions(
+        string json,
+        bool enableEnvReplacement,
+        EnvironmentVariableReplacementFailureMode replacementFailureMode = EnvironmentVariableReplacementFailureMode.Throw)
+    {
+        JsonSerializerOptions options = new()
+        {
+            PropertyNameCaseInsensitive = false,
+            PropertyNamingPolicy = new HyphenatedNamingPolicy(),
+            ReadCommentHandling = JsonCommentHandling.Skip
+        };
+        DeserializationVariableReplacementSettings envOnlySettings = new(
+            azureKeyVaultOptions: null,
+            doReplaceEnvVar: enableEnvReplacement,
+            doReplaceAkvVar: false,
+            envFailureMode: replacementFailureMode);
+        options.Converters.Add(new StringJsonConverterFactory(envOnlySettings));
+        options.Converters.Add(new EnumMemberJsonEnumConverterFactory());
+        options.Converters.Add(new AzureKeyVaultOptionsConverterFactory(replacementSettings: envOnlySettings));
+        options.Converters.Add(new AKVRetryPolicyOptionsConverterFactory(replacementSettings: envOnlySettings));
+
+        try
+        {
+            using JsonDocument doc = JsonDocument.Parse(json);
+            if (doc.RootElement.TryGetProperty("azure-key-vault", out JsonElement akvElement))
+            {
+                return JsonSerializer.Deserialize<AzureKeyVaultOptions>(akvElement.GetRawText(), options);
+            }
+        }
+        catch
+        {
+            // If we can't extract AKV options, return null and proceed without AKV variable replacement
+            return null;
+        }
+
+        return null;
+    }
+
+    /// <summary>
     /// Parses a JSON string into a <c>RuntimeConfig</c> object for single database scenario.
     /// </summary>
     /// <param name="json">JSON that represents the config file.</param>
     /// <param name="config">The parsed config, or null if it parsed unsuccessfully.</param>
-    /// <returns>True if the config was parsed, otherwise false.</returns>
-    /// <param name="logger">logger to log messages</param>
+    /// <param name="parseError">A clean error message when parsing fails, or null on success.</param>
+    /// <param name="replacementSettings">Settings for variable replacement during deserialization. If null, no variable replacement will be performed.</param>
     /// <param name="connectionString">connectionString to add to config if specified</param>
-    /// <param name="replaceEnvVar">Whether to replace environment variable with its
-    /// value or not while deserializing. By default, no replacement happens.</param>
-    /// <param name="replacementFailureMode">Determines failure mode for env variable replacement.</param>
+    /// <returns>True if the config was parsed, otherwise false.</returns>
     public static bool TryParseConfig(string json,
         [NotNullWhen(true)] out RuntimeConfig? config,
-        ILogger? logger = null,
-        string? connectionString = null,
-        bool replaceEnvVar = false,
-        EnvironmentVariableReplacementFailureMode replacementFailureMode = EnvironmentVariableReplacementFailureMode.Throw)
+        DeserializationVariableReplacementSettings? replacementSettings = null,
+        string? connectionString = null)
     {
-        JsonSerializerOptions options = GetSerializationOptions(replaceEnvVar, replacementFailureMode);
+        return TryParseConfig(json, out config, out _, replacementSettings, connectionString);
+    }
+
+    /// <summary>
+    /// Parses a JSON string into a <c>RuntimeConfig</c> object for single database scenario.
+    /// </summary>
+    /// <param name="json">JSON that represents the config file.</param>
+    /// <param name="config">The parsed config, or null if it parsed unsuccessfully.</param>
+    /// <param name="parseError">A clean error message when parsing fails, or null on success.</param>
+    /// <param name="replacementSettings">Settings for variable replacement during deserialization. If null, no variable replacement will be performed.</param>
+    /// <param name="connectionString">connectionString to add to config if specified</param>
+    /// <returns>True if the config was parsed, otherwise false.</returns>
+    public static bool TryParseConfig(string json,
+        [NotNullWhen(true)] out RuntimeConfig? config,
+        out string? parseError,
+        DeserializationVariableReplacementSettings? replacementSettings = null,
+        string? connectionString = null)
+    {
+        parseError = null;
+        // First pass: extract AzureKeyVault options if AKV replacement is requested
+        if (replacementSettings?.DoReplaceAkvVar is true)
+        {
+            AzureKeyVaultOptions? azureKeyVaultOptions = ExtractAzureKeyVaultOptions(
+                json: json,
+                enableEnvReplacement: replacementSettings.DoReplaceEnvVar,
+                replacementFailureMode: replacementSettings.EnvFailureMode);
+
+            // Update replacement settings with the extracted AKV options
+            if (azureKeyVaultOptions is not null)
+            {
+                replacementSettings = new DeserializationVariableReplacementSettings(
+                    azureKeyVaultOptions: azureKeyVaultOptions,
+                    doReplaceEnvVar: replacementSettings.DoReplaceEnvVar,
+                    doReplaceAkvVar: replacementSettings.DoReplaceAkvVar,
+                    envFailureMode: replacementSettings.EnvFailureMode);
+            }
+        }
+
+        JsonSerializerOptions options = GetSerializationOptions(replacementSettings);
 
         try
         {
@@ -159,7 +239,7 @@ public abstract class RuntimeConfigLoader
             }
 
             // retreive current connection string from config
-            string updatedConnectionString = config.DataSource.ConnectionString;
+            string updatedConnectionString = config.DataSource?.ConnectionString ?? string.Empty;
 
             if (!string.IsNullOrEmpty(connectionString))
             {
@@ -167,34 +247,39 @@ public abstract class RuntimeConfigLoader
                 updatedConnectionString = connectionString;
             }
 
-            Dictionary<string, string> datasourceNameToConnectionString = new();
-
-            // add to dictionary if datasourceName is present
-            datasourceNameToConnectionString.TryAdd(config.DefaultDataSourceName, updatedConnectionString);
-
-            // iterate over dictionary and update runtime config with connection strings.
-            foreach ((string dataSourceKey, string connectionValue) in datasourceNameToConnectionString)
+            // Post-processing for connection strings only applies when a data source is present.
+            // Root configs (with data-source-files) may not have a data source.
+            if (config.DataSource is not null)
             {
-                string updatedConnection = connectionValue;
+                Dictionary<string, string> datasourceNameToConnectionString = new();
 
-                DataSource ds = config.GetDataSourceFromDataSourceName(dataSourceKey);
+                // add to dictionary if datasourceName is present
+                datasourceNameToConnectionString.TryAdd(config.DefaultDataSourceName, updatedConnectionString);
 
-                // Add Application Name for telemetry for MsSQL or PgSql
-                if (ds.DatabaseType is DatabaseType.MSSQL && replaceEnvVar)
+                // iterate over dictionary and update runtime config with connection strings.
+                foreach ((string dataSourceKey, string connectionValue) in datasourceNameToConnectionString)
                 {
-                    updatedConnection = GetConnectionStringWithApplicationName(connectionValue);
-                }
-                else if (ds.DatabaseType is DatabaseType.PostgreSQL && replaceEnvVar)
-                {
-                    updatedConnection = GetPgSqlConnectionStringWithApplicationName(connectionValue);
-                }
+                    string updatedConnection = connectionValue;
 
-                ds = ds with { ConnectionString = updatedConnection };
-                config.UpdateDataSourceNameToDataSource(config.DefaultDataSourceName, ds);
+                    DataSource ds = config.GetDataSourceFromDataSourceName(dataSourceKey);
 
-                if (string.Equals(dataSourceKey, config.DefaultDataSourceName, StringComparison.OrdinalIgnoreCase))
-                {
-                    config = config with { DataSource = ds };
+                    // Add Application Name for telemetry for MsSQL or PgSql
+                    if (ds.DatabaseType is DatabaseType.MSSQL && replacementSettings?.DoReplaceEnvVar == true)
+                    {
+                        updatedConnection = GetConnectionStringWithApplicationName(connectionValue);
+                    }
+                    else if (ds.DatabaseType is DatabaseType.PostgreSQL && replacementSettings?.DoReplaceEnvVar == true)
+                    {
+                        updatedConnection = GetPgSqlConnectionStringWithApplicationName(connectionValue);
+                    }
+
+                    ds = ds with { ConnectionString = updatedConnection };
+                    config.UpdateDataSourceNameToDataSource(config.DefaultDataSourceName, ds);
+
+                    if (string.Equals(dataSourceKey, config.DefaultDataSourceName, StringComparison.OrdinalIgnoreCase))
+                    {
+                        config = config with { DataSource = ds };
+                    }
                 }
             }
         }
@@ -202,18 +287,9 @@ public abstract class RuntimeConfigLoader
             ex is JsonException ||
             ex is DataApiBuilderException)
         {
-            string errorMessage = ex is JsonException ? "Deserialization of the configuration file failed." :
-                "Deserialization of the configuration file failed during a post-processing step.";
-
-            // logger can be null when called from CLI
-            if (logger is null)
-            {
-                Console.Error.WriteLine(errorMessage + $"\n" + $"Message:\n {ex.Message}\n" + $"Stack Trace:\n {ex.StackTrace}");
-            }
-            else
-            {
-                logger.LogError(exception: ex, message: errorMessage);
-            }
+            parseError = ex is DataApiBuilderException
+                ? ex.Message
+                : $"Deserialization of the configuration file failed. {ex.Message}";
 
             config = null;
             return false;
@@ -225,11 +301,10 @@ public abstract class RuntimeConfigLoader
     /// <summary>
     /// Get Serializer options for the config file.
     /// </summary>
-    /// <param name="replaceEnvVar">Whether to replace environment variable with value or not while deserializing.
-    /// By default, no replacement happens.</param>
+    /// <param name="replacementSettings">Settings for variable replacement during deserialization.
+    /// If null, no variable replacement will be performed.</param>
     public static JsonSerializerOptions GetSerializationOptions(
-        bool replaceEnvVar = false,
-        EnvironmentVariableReplacementFailureMode replacementFailureMode = EnvironmentVariableReplacementFailureMode.Throw)
+        DeserializationVariableReplacementSettings? replacementSettings = null)
     {
         JsonSerializerOptions options = new()
         {
@@ -241,33 +316,43 @@ public abstract class RuntimeConfigLoader
             Encoder = JavaScriptEncoder.UnsafeRelaxedJsonEscaping
         };
         options.Converters.Add(new EnumMemberJsonEnumConverterFactory());
-        options.Converters.Add(new RuntimeHealthOptionsConvertorFactory(replaceEnvVar));
-        options.Converters.Add(new DataSourceHealthOptionsConvertorFactory(replaceEnvVar));
+        options.Converters.Add(new RuntimeHealthOptionsConvertorFactory(replacementSettings));
+        options.Converters.Add(new DataSourceHealthOptionsConvertorFactory(replacementSettings));
         options.Converters.Add(new EntityHealthOptionsConvertorFactory());
         options.Converters.Add(new RestRuntimeOptionsConverterFactory());
-        options.Converters.Add(new GraphQLRuntimeOptionsConverterFactory(replaceEnvVar));
-        options.Converters.Add(new McpRuntimeOptionsConverterFactory(replaceEnvVar));
+        options.Converters.Add(new GraphQLRuntimeOptionsConverterFactory(replacementSettings));
+        options.Converters.Add(new McpRuntimeOptionsConverterFactory(replacementSettings));
         options.Converters.Add(new DmlToolsConfigConverter());
-        options.Converters.Add(new EntitySourceConverterFactory(replaceEnvVar));
-        options.Converters.Add(new EntityGraphQLOptionsConverterFactory(replaceEnvVar));
-        options.Converters.Add(new EntityRestOptionsConverterFactory(replaceEnvVar));
+        options.Converters.Add(new EntitySourceConverterFactory(replacementSettings));
+        options.Converters.Add(new EntityGraphQLOptionsConverterFactory(replacementSettings));
+        options.Converters.Add(new EntityRestOptionsConverterFactory(replacementSettings));
         options.Converters.Add(new EntityActionConverterFactory());
         options.Converters.Add(new DataSourceFilesConverter());
-        options.Converters.Add(new EntityCacheOptionsConverterFactory(replaceEnvVar));
+        options.Converters.Add(new EntityCacheOptionsConverterFactory(replacementSettings));
+        options.Converters.Add(new AutoentityConverter(replacementSettings));
+        options.Converters.Add(new AutoentityPatternsConverter(replacementSettings));
+        options.Converters.Add(new AutoentityTemplateConverter(replacementSettings));
+        options.Converters.Add(new EntityMcpOptionsConverterFactory());
         options.Converters.Add(new RuntimeCacheOptionsConverterFactory());
         options.Converters.Add(new RuntimeCacheLevel2OptionsConverterFactory());
+        options.Converters.Add(new CompressionOptionsConverterFactory());
         options.Converters.Add(new MultipleCreateOptionsConverter());
         options.Converters.Add(new MultipleMutationOptionsConverter(options));
-        options.Converters.Add(new DataSourceConverterFactory(replaceEnvVar));
+        options.Converters.Add(new DataSourceConverterFactory(replacementSettings));
         options.Converters.Add(new HostOptionsConvertorFactory());
-        options.Converters.Add(new AKVRetryPolicyOptionsConverterFactory(replaceEnvVar));
-        options.Converters.Add(new AzureLogAnalyticsOptionsConverterFactory(replaceEnvVar));
-        options.Converters.Add(new AzureLogAnalyticsAuthOptionsConverter(replaceEnvVar));
-        options.Converters.Add(new FileSinkConverter(replaceEnvVar));
+        options.Converters.Add(new AKVRetryPolicyOptionsConverterFactory(replacementSettings));
+        options.Converters.Add(new AzureLogAnalyticsOptionsConverterFactory(replacementSettings));
+        options.Converters.Add(new AzureLogAnalyticsAuthOptionsConverter(replacementSettings));
+        options.Converters.Add(new BoolJsonConverter());
+        options.Converters.Add(new FileSinkConverter(replacementSettings));
 
-        if (replaceEnvVar)
+        // Add AzureKeyVaultOptionsConverterFactory to ensure AKV config is deserialized properly
+        options.Converters.Add(new AzureKeyVaultOptionsConverterFactory(replacementSettings));
+
+        // Only add the extensible string converter if we have replacement settings
+        if (replacementSettings is not null)
         {
-            options.Converters.Add(new StringJsonConverterFactory(replacementFailureMode));
+            options.Converters.Add(new StringJsonConverterFactory(replacementSettings));
         }
 
         return options;
@@ -428,5 +513,10 @@ public abstract class RuntimeConfigLoader
 
             RuntimeConfig = runtimeConfigCopy;
         }
+    }
+
+    public void EditRuntimeConfig(RuntimeConfig newRuntimeConfig)
+    {
+        RuntimeConfig = newRuntimeConfig;
     }
 }

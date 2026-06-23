@@ -1,7 +1,7 @@
 ﻿<Project Sdk="Microsoft.NET.Sdk.Web">
 
     <PropertyGroup>
-        <TargetFrameworks>net8.0</TargetFrameworks>
+        <TargetFramework>net8.0</TargetFramework>
         <Configurations>Debug;Release;Docker</Configurations>
         <OutputPath>$(BaseOutputPath)\engine</OutputPath>
         <RuntimeIdentifiers>win-x64;linux-x64;osx-x64</RuntimeIdentifiers>
@@ -22,13 +22,11 @@
     </ItemGroup>
 
     <!--
-    Set the CopyToOutputDirectory action based on the configuration.
-    In Debug/Release, we'll copy the config, appsettings, sql and gql files, but not in Docker configuration since we don't want them to end up in the docker image.
+    Set the CopyToOutputDirectory action to Always since we only have appsettings and default config
+    as additional files that are both expected to be in the output directory.
   -->
     <PropertyGroup>
-        <CopyToOutputDirectoryAction Condition="'$(Configuration)' == 'Debug'">Always</CopyToOutputDirectoryAction>
-        <CopyToOutputDirectoryAction Condition="'$(Configuration)' == 'Release'">Always</CopyToOutputDirectoryAction>
-        <CopyToOutputDirectoryAction Condition="'$(Configuration)'=='Docker'">Never</CopyToOutputDirectoryAction>
+        <CopyToOutputDirectoryAction>Always</CopyToOutputDirectoryAction>
         <PackageLicenseFile>LICENSE.txt</PackageLicenseFile>
     </PropertyGroup>
 
@@ -64,6 +62,7 @@
         <PackageReference Include="Microsoft.ApplicationInsights.AspNetCore" />
         <PackageReference Include="Microsoft.Extensions.Logging.ApplicationInsights" />
         <PackageReference Include="Microsoft.Azure.Cosmos" />
+        <PackageReference Include="Microsoft.Azure.StackExchangeRedis" />
         <PackageReference Include="Microsoft.Data.SqlClient" />
         <PackageReference Include="Microsoft.Extensions.Configuration.Binder" />
         <PackageReference Include="Microsoft.Extensions.Configuration.Json" />

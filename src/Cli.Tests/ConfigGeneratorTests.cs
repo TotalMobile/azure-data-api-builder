@@ -139,7 +139,7 @@ public class ConfigGeneratorTests
             setSessionContext: false,
             hostMode: HostMode.Production,
             corsOrigin: null,
-            authenticationProvider: EasyAuthType.StaticWebApps.ToString(),
+            authenticationProvider: EasyAuthType.AppService.ToString(),
             config: TEST_RUNTIME_CONFIG_FILE);
 
         StringBuilder expectedRuntimeConfigJson = new(
@@ -156,7 +156,7 @@ public class ConfigGeneratorTests
                 ""rest"": {
                   ""enabled"": true,
                   ""path"": ""/api"",
-                  ""request-body-strict"": true
+                  ""request-body-strict"": false
                   },
                 ""graphql"": {
                   ""enabled"": true,
@@ -173,11 +173,20 @@ public class ConfigGeneratorTests
                     ""allow-credentials"": false
                         },
                   ""authentication"": {
-                    ""provider"": ""StaticWebApps""
+                    ""provider"": ""AppService""
                         },
                   ""mode"": ""production""
+                                    },
+                                ""telemetry"": {
+                                    ""open-telemetry"": {
+                                        ""enabled"": true,
+                                        ""endpoint"": ""@env('OTEL_EXPORTER_OTLP_ENDPOINT')"",
+                                        ""headers"": ""@env('OTEL_EXPORTER_OTLP_HEADERS')"",
+                                        ""service-name"": ""@env('OTEL_SERVICE_NAME')""
+                                    }
                   }
               },
+              ""autoentities"": {},
               ""entities"": {}
             }");
 

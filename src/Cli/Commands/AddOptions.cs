@@ -33,7 +33,9 @@ namespace Cli.Commands
             string? policyRequest,
             string? policyDatabase,
             string? cacheEnabled,
-            string? cacheTtl,
+            string? cacheTtlSeconds,
+            string? cacheLevel,
+            string? healthEnabled,
             string? description,
             IEnumerable<string>? parametersNameCollection,
             IEnumerable<string>? parametersDescriptionCollection,
@@ -43,7 +45,9 @@ namespace Cli.Commands
             IEnumerable<string>? fieldsAliasCollection,
             IEnumerable<string>? fieldsDescriptionCollection,
             IEnumerable<bool>? fieldsPrimaryKeyCollection,
-            string? config
+            string? mcpDmlTools = null,
+            string? mcpCustomTool = null,
+            string? config = null
         )
         : base(
             entity,
@@ -59,7 +63,9 @@ namespace Cli.Commands
             policyRequest,
             policyDatabase,
             cacheEnabled,
-            cacheTtl,
+            cacheTtlSeconds,
+            cacheLevel,
+            healthEnabled,
             description,
             parametersNameCollection,
             parametersDescriptionCollection,
@@ -69,6 +75,8 @@ namespace Cli.Commands
             fieldsAliasCollection,
             fieldsDescriptionCollection,
             fieldsPrimaryKeyCollection,
+            mcpDmlTools,
+            mcpCustomTool,
             config
         )
         {

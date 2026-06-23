@@ -9,9 +9,8 @@ namespace Azure.DataApiBuilder.Config.Converters;
 
 internal class DataSourceConverterFactory : JsonConverterFactory
 {
-    // Determines whether to replace environment variable with its
-    // value or not while deserializing.
-    private bool _replaceEnvVar;
+    // Settings for variable replacement during deserialization.
+    private readonly DeserializationVariableReplacementSettings? _replacementSettings;
 
     /// <inheritdoc/>
     public override bool CanConvert(Type typeToConvert)
@@ -22,27 +21,26 @@ internal class DataSourceConverterFactory : JsonConverterFactory
     /// <inheritdoc/>
     public override JsonConverter? CreateConverter(Type typeToConvert, JsonSerializerOptions options)
     {
-        return new DataSourceConverter(_replaceEnvVar);
+        return new DataSourceConverter(_replacementSettings);
     }
 
-    /// <param name="replaceEnvVar">Whether to replace environment variable with its
-    /// value or not while deserializing.</param>
-    internal DataSourceConverterFactory(bool replaceEnvVar)
+    /// <param name="replacementSettings">Settings for variable replacement during deserialization.
+    /// If null, no variable replacement will be performed.</param>
+    internal DataSourceConverterFactory(DeserializationVariableReplacementSettings? replacementSettings = null)
     {
-        _replaceEnvVar = replaceEnvVar;
+        _replacementSettings = replacementSettings;
     }
 
     private class DataSourceConverter : JsonConverter<DataSource>
     {
-        // Determines whether to replace environment variable with its
-        // value or not while deserializing.
-        private bool _replaceEnvVar;
+        // Settings for variable replacement during deserialization.
+        private readonly DeserializationVariableReplacementSettings? _replacementSettings;
 
-        /// <param name="replaceEnvVar">Whether to replace environment variable with its
-        /// value or not while deserializing.</param>
-        public DataSourceConverter(bool replaceEnvVar)
+        /// <param name="replacementSettings">Settings for variable replacement during deserialization.
+        /// If null, no variable replacement will be performed.</param>
+        public DataSourceConverter(DeserializationVariableReplacementSettings? replacementSettings)
         {
-            _replaceEnvVar = replaceEnvVar;
+            _replacementSettings = replacementSettings;
         }
 
         public override DataSource? Read(ref Utf8JsonReader reader, Type typeToConvert, JsonSerializerOptions options)
@@ -53,12 +51,16 @@ internal class DataSourceConverterFactory : JsonConverterFactory
                 string connectionString = string.Empty;
                 DatasourceHealthCheckConfig? health = null;
                 Dictionary<string, object?>? datasourceOptions = null;
+                UserDelegatedAuthOptions? userDelegatedAuth = null;
 
                 while (reader.Read())
                 {
                     if (reader.TokenType is JsonTokenType.EndObject)
                     {
-                        return new DataSource(databaseType, connectionString, datasourceOptions, health);
+                        return new DataSource(databaseType, connectionString, datasourceOptions, health)
+                        {
+                            UserDelegatedAuth = userDelegatedAuth
+                        };
                     }
 
                     if (reader.TokenType is JsonTokenType.PropertyName)
@@ -69,11 +71,11 @@ internal class DataSourceConverterFactory : JsonConverterFactory
                         switch (propertyName)
                         {
                             case "database-type":
-                                databaseType = EnumExtensions.Deserialize<DatabaseType>(reader.DeserializeString(_replaceEnvVar)!);
+                                databaseType = EnumExtensions.Deserialize<DatabaseType>(reader.DeserializeString(_replacementSettings)!);
                                 break;
 
                             case "connection-string":
-                                connectionString = reader.DeserializeString(replaceEnvVar: _replaceEnvVar)!;
+                                connectionString = reader.DeserializeString(_replacementSettings)!;
                                 break;
 
                             case "health":
@@ -106,7 +108,7 @@ internal class DataSourceConverterFactory : JsonConverterFactory
                                         if (reader.TokenType is JsonTokenType.String)
                                         {
                                             // Determine whether to resolve the environment variable or keep as-is.
-                                            string stringValue = reader.DeserializeString(replaceEnvVar: _replaceEnvVar)!;
+                                            string stringValue = reader.DeserializeString(_replacementSettings)!;
 
                                             if (bool.TryParse(stringValue, out bool boolValue))
                                             {
@@ -136,6 +138,20 @@ internal class DataSourceConverterFactory : JsonConverterFactory
                                     }
 
                                     datasourceOptions = optionsDict;
+                                }
+
+                                break;
+                            case "user-delegated-auth":
+                                if (reader.TokenType != JsonTokenType.Null)
+                                {
+                                    try
+                                    {
+                                        userDelegatedAuth = JsonSerializer.Deserialize<UserDelegatedAuthOptions>(ref reader, options);
+                                    }
+                                    catch (Exception e)
+                                    {
+                                        throw new JsonException($"Error while deserializing DataSource user-delegated-auth: {e.Message}");
+                                    }
                                 }
 
                                 break;

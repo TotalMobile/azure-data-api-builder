@@ -11,7 +11,7 @@ internal class DataSourceHealthOptionsConvertorFactory : JsonConverterFactory
 {
     // Determines whether to replace environment variable with its
     // value or not while deserializing.
-    private bool _replaceEnvVar;
+    private readonly DeserializationVariableReplacementSettings? _replacementSettings;
 
     /// <inheritdoc/>
     public override bool CanConvert(Type typeToConvert)
@@ -22,27 +22,27 @@ internal class DataSourceHealthOptionsConvertorFactory : JsonConverterFactory
     /// <inheritdoc/>
     public override JsonConverter? CreateConverter(Type typeToConvert, JsonSerializerOptions options)
     {
-        return new HealthCheckOptionsConverter(_replaceEnvVar);
+        return new HealthCheckOptionsConverter(_replacementSettings);
     }
 
     /// <param name="replaceEnvVar">Whether to replace environment variable with its
     /// value or not while deserializing.</param>
-    internal DataSourceHealthOptionsConvertorFactory(bool replaceEnvVar)
+    internal DataSourceHealthOptionsConvertorFactory(DeserializationVariableReplacementSettings? replacementSettings)
     {
-        _replaceEnvVar = replaceEnvVar;
+        _replacementSettings = replacementSettings;
     }
 
     private class HealthCheckOptionsConverter : JsonConverter<DatasourceHealthCheckConfig>
     {
         // Determines whether to replace environment variable with its
         // value or not while deserializing.
-        private bool _replaceEnvVar;
+        private readonly DeserializationVariableReplacementSettings? _replacementSettings;
 
         /// <param name="replaceEnvVar">Whether to replace environment variable with its
         /// value or not while deserializing.</param>
-        public HealthCheckOptionsConverter(bool replaceEnvVar)
+        public HealthCheckOptionsConverter(DeserializationVariableReplacementSettings? replacementSettings)
         {
-            _replaceEnvVar = replaceEnvVar;
+            _replacementSettings = replacementSettings;
         }
 
         /// <summary>
@@ -85,7 +85,7 @@ internal class DataSourceHealthOptionsConvertorFactory : JsonConverterFactory
                         case "name":
                             if (reader.TokenType is not JsonTokenType.Null)
                             {
-                                name = reader.DeserializeString(_replaceEnvVar);
+                                name = reader.DeserializeString(_replacementSettings);
                             }
 
                             break;
@@ -114,11 +114,21 @@ internal class DataSourceHealthOptionsConvertorFactory : JsonConverterFactory
 
         public override void Write(Utf8JsonWriter writer, DatasourceHealthCheckConfig value, JsonSerializerOptions options)
         {
-            if (value?.UserProvidedEnabled is true)
+            // Write the health object if any of these conditions are met:
+            // - enabled was explicitly provided by the user
+            // - name property has a value
+            // - threshold was explicitly provided by the user
+            if (value?.UserProvidedEnabled is true || value?.Name is not null || value?.UserProvidedThresholdMs is true)
             {
                 writer.WriteStartObject();
-                writer.WritePropertyName("enabled");
-                JsonSerializer.Serialize(writer, value.Enabled, options);
+
+                // Only write enabled if it was explicitly provided by the user
+                if (value?.UserProvidedEnabled is true)
+                {
+                    writer.WritePropertyName("enabled");
+                    JsonSerializer.Serialize(writer, value.Enabled, options);
+                }
+
                 if (value?.Name is not null)
                 {
                     writer.WritePropertyName("name");

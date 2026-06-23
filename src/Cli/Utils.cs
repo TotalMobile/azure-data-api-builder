@@ -23,6 +23,36 @@ namespace Cli
         public const string WILDCARD = "*";
         public static readonly string SEPARATOR = ":";
 
+        /// <summary>
+        /// When true, CLI logging to stdout is suppressed to keep the MCP stdio channel clean.
+        /// </summary>
+        public static bool IsMcpStdioMode { get; set; }
+
+        /// <summary>
+        /// When true, the CLI is the source overriding the log level (i.e., <c>--LogLevel</c> was supplied).
+        /// This allows logs to be written to stderr instead of being completely suppressed.
+        /// </summary>
+        public static bool IsCliOverriding { get; set; }
+
+        /// <summary>
+        /// The log level specified via CLI --LogLevel flag.
+        /// Only valid when IsCliOverriding is true.
+        /// </summary>
+        public static LogLevel CliLogLevel { get; set; } = LogLevel.Information;
+
+        /// <summary>
+        /// When true, the runtime config is the source overriding the log level
+        /// (i.e., <c>runtime.telemetry.log-level</c> was explicitly set).
+        /// This allows CLI logs to be written to stderr in MCP mode even when no --LogLevel flag was provided.
+        /// </summary>
+        public static bool IsConfigOverriding { get; set; }
+
+        /// <summary>
+        /// The log level specified via runtime config file's log-level setting.
+        /// Only valid when IsConfigOverriding is true.
+        /// </summary>
+        public static LogLevel ConfigLogLevel { get; set; } = LogLevel.Information;
+
 #pragma warning disable CS8618 // Non-nullable field must contain a non-null value when exiting constructor. Consider declaring as nullable.
         private static ILogger<Utils> _logger;
 #pragma warning restore CS8618
@@ -309,19 +339,37 @@ namespace Cli
         public static bool TryGetConfigFileBasedOnCliPrecedence(
             FileSystemRuntimeConfigLoader loader,
             string? userProvidedConfigFile,
-            out string runtimeConfigFile)
+            out string runtimeConfigFile,
+            LogBuffer? logBuffer = null)
         {
             if (!string.IsNullOrEmpty(userProvidedConfigFile))
             {
                 /// The existence of user provided config file is not checked here.
-                _logger.LogInformation("User provided config file: {userProvidedConfigFile}", userProvidedConfigFile);
+                if (logBuffer is null)
+                {
+                    _logger.LogInformation("User provided config file: {userProvidedConfigFile}", userProvidedConfigFile);
+                }
+                else
+                {
+                    logBuffer.BufferLog(LogLevel.Information, $"User provided config file: {userProvidedConfigFile}");
+                }
+
                 runtimeConfigFile = userProvidedConfigFile;
                 return true;
             }
             else
             {
-                _logger.LogInformation("Config not provided. Trying to get default config based on DAB_ENVIRONMENT...");
-                _logger.LogInformation("Environment variable DAB_ENVIRONMENT is {environment}", Environment.GetEnvironmentVariable("DAB_ENVIRONMENT"));
+                if (logBuffer is null)
+                {
+                    _logger.LogInformation("Config not provided. Trying to get default config based on DAB_ENVIRONMENT...");
+                    _logger.LogInformation("Environment variable DAB_ENVIRONMENT is {environment}", Environment.GetEnvironmentVariable("DAB_ENVIRONMENT"));
+                }
+                else
+                {
+                    logBuffer.BufferLog(LogLevel.Information, "Config not provided. Trying to get default config based on DAB_ENVIRONMENT...");
+                    logBuffer.BufferLog(LogLevel.Information, $"Environment variable DAB_ENVIRONMENT is {Environment.GetEnvironmentVariable("DAB_ENVIRONMENT")}");
+                }
+
                 runtimeConfigFile = loader.GetFileNameForEnvironment(null, considerOverrides: false);
             }
 
@@ -516,11 +564,12 @@ namespace Cli
             string? issuer)
         {
             if (Enum.TryParse<EasyAuthType>(authenticationProvider, ignoreCase: true, out _)
-                || AuthenticationOptions.SIMULATOR_AUTHENTICATION == authenticationProvider)
+                || AuthenticationOptions.SIMULATOR_AUTHENTICATION.Equals(authenticationProvider, StringComparison.OrdinalIgnoreCase)
+                || AuthenticationOptions.UNAUTHENTICATED_AUTHENTICATION.Equals(authenticationProvider, StringComparison.OrdinalIgnoreCase))
             {
                 if (!(string.IsNullOrWhiteSpace(audience)) || !(string.IsNullOrWhiteSpace(issuer)))
                 {
-                    _logger.LogWarning("Audience and Issuer can't be set for EasyAuth or Simulator authentication.");
+                    _logger.LogWarning("Audience and Issuer can't be set for EasyAuth, Simulator, or Unauthenticated authentication.");
                     return true;
                 }
             }
@@ -528,7 +577,7 @@ namespace Cli
             {
                 if (string.IsNullOrWhiteSpace(audience) || string.IsNullOrWhiteSpace(issuer))
                 {
-                    _logger.LogError($"Authentication providers other than EasyAuth and Simulator require both Audience and Issuer.");
+                    _logger.LogError($"Authentication providers other than EasyAuth, Simulator, and Unauthenticated require both Audience and Issuer.");
                     return false;
                 }
             }
@@ -601,7 +650,7 @@ namespace Cli
         {
             if (!Enum.TryParse(method, ignoreCase: true, out restMethod))
             {
-                _logger.LogError("Invalid REST Method. Supported methods are {restMethods}.", string.Join(", ", Enum.GetNames<SupportedHttpVerb>()));
+                _logger.LogError("Invalid REST Method. Supported methods are {restMethods}.", string.Join(", ", Enum.GetNames<SupportedHttpVerb>().Select(n => n.ToLowerInvariant())));
                 return false;
             }
 
@@ -651,8 +700,8 @@ namespace Cli
             {
                 _logger.LogError(
                     "Invalid GraphQL Operation. Supported operations are {queryName} and {mutationName}.",
-                    GraphQLOperation.Query,
-                    GraphQLOperation.Mutation);
+                    nameof(GraphQLOperation.Query).ToLowerInvariant(),
+                    nameof(GraphQLOperation.Mutation).ToLowerInvariant());
                 return false;
             }
 
@@ -846,50 +895,116 @@ namespace Cli
         /// Constructs the EntityCacheOption for Add/Update.
         /// </summary>
         /// <param name="cacheEnabled">String value that defines if the cache is enabled.</param>
-        /// <param name="cacheTtl">Int that gives time to live in seconds for cache.</param>
-        /// <returns>EntityCacheOption if values are provided for cacheEnabled or cacheTtl, null otherwise.</returns>
-        public static EntityCacheOptions? ConstructCacheOptions(string? cacheEnabled, string? cacheTtl)
+        /// <param name="cacheTtlSeconds">Int that gives time to live in seconds for cache.</param>
+        /// <returns>EntityCacheOption if values are provided for cacheEnabled or cacheTtlSeconds, null otherwise.</returns>
+        public static EntityCacheOptions? ConstructCacheOptions(string? cacheEnabled, string? cacheTtlSeconds, string? cacheLevel = null)
         {
-            if (cacheEnabled is null && cacheTtl is null)
+            if (cacheEnabled is null && cacheTtlSeconds is null && cacheLevel is null)
             {
                 return null;
             }
 
-            EntityCacheOptions cacheOptions = new();
             bool isEnabled = false;
-            bool isCacheTtlUserProvided = false;
             int ttl = EntityCacheOptions.DEFAULT_TTL_SECONDS;
+            EntityCacheLevel? level = null;
 
             if (cacheEnabled is not null && !bool.TryParse(cacheEnabled, out isEnabled))
             {
                 _logger.LogError("Invalid format for --cache.enabled. Accepted values are true/false.");
             }
 
-            if ((cacheTtl is not null && !int.TryParse(cacheTtl, out ttl)) || ttl < 0)
+            if ((cacheTtlSeconds is not null && !int.TryParse(cacheTtlSeconds, out ttl)) || ttl < 0)
             {
-                _logger.LogError("Invalid format for --cache.ttl. Accepted values are any non-negative integer.");
+                _logger.LogError("Invalid format for --cache.ttl-seconds. Accepted values are any non-negative integer.");
             }
 
-            // This is needed so the cacheTtl is correctly written to config.
-            if (cacheTtl is not null)
+            if (cacheLevel is not null && !Enum.TryParse(cacheLevel, ignoreCase: true, out EntityCacheLevel _))
             {
-                isCacheTtlUserProvided = true;
+                _logger.LogError("Invalid format for --cache.level. Accepted values are L1, L1L2.");
+            }
+            else if (cacheLevel is not null)
+            {
+                level = Enum.Parse<EntityCacheLevel>(cacheLevel, ignoreCase: true);
             }
 
-            // Both cacheEnabled and cacheTtl can not be null here, so if either one
-            // is, the other is not, and we return the cacheOptions with just that other
-            // value.
-            if (cacheEnabled is null)
+            // Use the constructor so UserProvided* flags are set automatically
+            // when a non-null value is passed.
+            return new EntityCacheOptions(
+                Enabled: cacheEnabled is not null ? isEnabled : null,
+                TtlSeconds: cacheTtlSeconds is not null ? ttl : null,
+                Level: level);
+        }
+
+        /// <summary>
+        /// Constructs EntityHealthCheckConfig for Add/Update.
+        /// </summary>
+        /// <param name="healthEnabled">String value that defines if health check is enabled for the entity.</param>
+        /// <returns>EntityHealthCheckConfig if a value is provided, null otherwise.</returns>
+        public static EntityHealthCheckConfig? ConstructEntityHealthOptions(string? healthEnabled)
+        {
+            if (healthEnabled is null)
             {
-                return cacheOptions with { TtlSeconds = ttl, UserProvidedTtlOptions = isCacheTtlUserProvided };
+                return null;
             }
 
-            if (cacheTtl is null)
+            if (!bool.TryParse(healthEnabled, out bool isEnabled))
             {
-                return cacheOptions with { Enabled = isEnabled };
+                _logger.LogError("Invalid format for --health.enabled. Accepted values are true/false.");
+                return null;
             }
 
-            return cacheOptions with { Enabled = isEnabled, TtlSeconds = ttl, UserProvidedTtlOptions = isCacheTtlUserProvided };
+            return new EntityHealthCheckConfig(enabled: isEnabled);
+        }
+
+        /// <summary>
+        /// Constructs the EntityMcpOptions for Add/Update.
+        /// </summary>
+        /// <param name="mcpDmlTools">String value that defines if DML tools are enabled for MCP.</param>
+        /// <param name="mcpCustomTool">String value that defines if custom tool is enabled for MCP.</param>
+        /// <param name="isStoredProcedure">Whether the entity is a stored procedure.</param>
+        /// <returns>EntityMcpOptions if values are provided, null otherwise.</returns>
+        public static EntityMcpOptions? ConstructMcpOptions(string? mcpDmlTools, string? mcpCustomTool, bool isStoredProcedure)
+        {
+            if (mcpDmlTools is null && mcpCustomTool is null)
+            {
+                return null;
+            }
+
+            bool? dmlToolsEnabled = null;
+            bool? customToolEnabled = null;
+
+            // Parse dml-tools option
+            if (mcpDmlTools is not null)
+            {
+                if (!bool.TryParse(mcpDmlTools, out bool dmlValue))
+                {
+                    _logger.LogError("Invalid format for --mcp.dml-tools. Accepted values are true/false.");
+                    return null;
+                }
+
+                dmlToolsEnabled = dmlValue;
+            }
+
+            // Parse custom-tool option
+            if (mcpCustomTool is not null)
+            {
+                if (!bool.TryParse(mcpCustomTool, out bool customValue))
+                {
+                    _logger.LogError("Invalid format for --mcp.custom-tool. Accepted values are true/false.");
+                    return null;
+                }
+
+                // Validate that custom-tool can only be used with stored procedures
+                if (customValue && !isStoredProcedure)
+                {
+                    _logger.LogError("--mcp.custom-tool can only be enabled for stored procedures.");
+                    return null;
+                }
+
+                customToolEnabled = customValue;
+            }
+
+            return new EntityMcpOptions(customToolEnabled, dmlToolsEnabled);
         }
 
         /// <summary>
@@ -909,10 +1024,10 @@ namespace Cli
         /// <summary>
         /// Returns ILoggerFactory with CLI custom logger provider.
         /// </summary>
-        public static ILoggerFactory GetLoggerFactoryForCli()
+        public static ILoggerFactory GetLoggerFactoryForCli(LogLevel minimumLogLevel = LogLevel.Information)
         {
             ILoggerFactory loggerFactory = new LoggerFactory();
-            loggerFactory.AddProvider(new CustomLoggerProvider());
+            loggerFactory.AddProvider(new CustomLoggerProvider(minimumLogLevel));
             return loggerFactory;
         }
     }

@@ -13,6 +13,18 @@ trigger:
     - gh-readonly-queue/main
     - release/*
 
+pr:
+  branches:
+    include:
+    - main
+    - release/*
+  paths:
+    exclude:
+    - samples/**
+    - docs/**
+    - '*.md'
+    - templates/**
+
 strategy:
   matrix:
     windows:
@@ -57,6 +69,7 @@ steps:
     projects: '$(solution)'
     feedsToUse: config
     nugetConfigPath: Nuget.config
+    restoreArguments: '/p:RuntimeIdentifiers=""'
 
 - task: DotNetCoreCLI@2
   displayName: Build

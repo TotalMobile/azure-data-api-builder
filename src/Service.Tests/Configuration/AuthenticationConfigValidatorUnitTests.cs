@@ -38,7 +38,7 @@ namespace Azure.DataApiBuilder.Service.Tests.Configuration
         public void ValidateEasyAuthConfig()
         {
             RuntimeConfig config =
-                CreateRuntimeConfigWithOptionalAuthN(new AuthenticationOptions(EasyAuthType.StaticWebApps.ToString(), null));
+                CreateRuntimeConfigWithOptionalAuthN(new AuthenticationOptions(EasyAuthType.AppService.ToString(), null));
 
             _mockFileSystem.AddFile(
                 FileSystemRuntimeConfigLoader.DEFAULT_CONFIG_FILE_NAME,
@@ -181,6 +181,25 @@ namespace Azure.DataApiBuilder.Service.Tests.Configuration
             {
                 _runtimeConfigValidator.ValidateConfigProperties();
             });
+        }
+
+        [TestMethod("Unauthenticated provider is correctly identified by IsUnauthenticatedAuthenticationProvider method")]
+        public void ValidateUnauthenticatedProviderIdentification()
+        {
+            // Test with Unauthenticated provider
+            AuthenticationOptions unauthenticatedOptions = new(Provider: "Unauthenticated");
+            Assert.IsTrue(unauthenticatedOptions.IsUnauthenticatedAuthenticationProvider());
+
+            // Test case-insensitivity
+            AuthenticationOptions unauthenticatedOptionsLower = new(Provider: "unauthenticated");
+            Assert.IsTrue(unauthenticatedOptionsLower.IsUnauthenticatedAuthenticationProvider());
+
+            // Test that other providers are not identified as Unauthenticated
+            AuthenticationOptions appServiceOptions = new(Provider: "AppService");
+            Assert.IsFalse(appServiceOptions.IsUnauthenticatedAuthenticationProvider());
+
+            AuthenticationOptions simulatorOptions = new(Provider: "Simulator");
+            Assert.IsFalse(simulatorOptions.IsUnauthenticatedAuthenticationProvider());
         }
 
         private static RuntimeConfig CreateRuntimeConfigWithOptionalAuthN(AuthenticationOptions authNConfig = null)

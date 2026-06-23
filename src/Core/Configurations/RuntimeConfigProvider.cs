@@ -6,7 +6,6 @@ using System.Diagnostics.CodeAnalysis;
 using System.IO.Abstractions;
 using System.Net;
 using Azure.DataApiBuilder.Config;
-using Azure.DataApiBuilder.Config.Converters;
 using Azure.DataApiBuilder.Config.NamingPolicies;
 using Azure.DataApiBuilder.Config.ObjectModel;
 using Azure.DataApiBuilder.Service.Exceptions;
@@ -189,12 +188,12 @@ public class RuntimeConfigProvider
         if (RuntimeConfigLoader.TryParseConfig(
                 configuration,
                 out RuntimeConfig? runtimeConfig,
-                replaceEnvVar: false,
-                replacementFailureMode: EnvironmentVariableReplacementFailureMode.Ignore))
+                out _,
+                replacementSettings: null))
         {
             _configLoader.RuntimeConfig = runtimeConfig;
 
-            if (string.IsNullOrEmpty(runtimeConfig.DataSource.ConnectionString))
+            if (string.IsNullOrEmpty(runtimeConfig.DataSource?.ConnectionString))
             {
                 throw new ArgumentException($"'{nameof(runtimeConfig.DataSource.ConnectionString)}' cannot be null or empty.", nameof(runtimeConfig.DataSource.ConnectionString));
             }
@@ -257,8 +256,7 @@ public class RuntimeConfigProvider
         string? graphQLSchema,
         string connectionString,
         string? accessToken,
-        bool replaceEnvVar = true,
-        EnvironmentVariableReplacementFailureMode replacementFailureMode = EnvironmentVariableReplacementFailureMode.Throw)
+        DeserializationVariableReplacementSettings? replacementSettings)
     {
         if (string.IsNullOrEmpty(connectionString))
         {
@@ -272,15 +270,26 @@ public class RuntimeConfigProvider
 
         IsLateConfigured = true;
 
-        if (RuntimeConfigLoader.TryParseConfig(jsonConfig, out RuntimeConfig? runtimeConfig, replaceEnvVar: replaceEnvVar, replacementFailureMode: replacementFailureMode))
+        if (RuntimeConfigLoader.TryParseConfig(jsonConfig, out RuntimeConfig? runtimeConfig, out _, replacementSettings))
         {
+            // Late configuration injects a connection string into the parsed config's data source.
+            // A config with no data source (e.g. a root config that delegates to data-source-files)
+            // is not meaningful here. Return false to preserve pre-existing behavior — on main, the
+            // RuntimeConfig constructor threw when DataSource was null and TryParseConfig converted
+            // that into a 'false' return. Since DataSource is now nullable, we make the same
+            // determination explicitly rather than NRE'ing in the 'with' expression below.
+            if (runtimeConfig.DataSource is null)
+            {
+                return false;
+            }
+
             _configLoader.RuntimeConfig = runtimeConfig.DataSource.DatabaseType switch
             {
                 DatabaseType.CosmosDB_NoSQL => HandleCosmosNoSqlConfiguration(graphQLSchema, runtimeConfig, connectionString),
                 _ => runtimeConfig with { DataSource = runtimeConfig.DataSource with { ConnectionString = connectionString } }
             };
             ManagedIdentityAccessToken[_configLoader.RuntimeConfig.DefaultDataSourceName] = accessToken;
-            _configLoader.RuntimeConfig.UpdateDataSourceNameToDataSource(_configLoader.RuntimeConfig.DefaultDataSourceName, _configLoader.RuntimeConfig.DataSource);
+            _configLoader.RuntimeConfig.UpdateDataSourceNameToDataSource(_configLoader.RuntimeConfig.DefaultDataSourceName, _configLoader.RuntimeConfig.DataSource!);
 
             return await InvokeConfigLoadedHandlersAsync();
         }
@@ -413,5 +422,48 @@ public class RuntimeConfigProvider
         runtimeConfig.UpdateDataSourceNameToDataSource(dataSourceName, dataSource);
 
         return runtimeConfig;
+    }
+
+    public void AddMergedEntitiesToConfig(Dictionary<string, Entity> newEntities)
+    {
+        Dictionary<string, Entity> entities = new(_configLoader.RuntimeConfig!.Entities);
+        foreach ((string name, Entity entity) in newEntities)
+        {
+            entities.Add(name, entity);
+        }
+
+        RuntimeConfig newRuntimeConfig = _configLoader.RuntimeConfig! with
+        {
+            Entities = new(entities)
+        };
+        _configLoader.EditRuntimeConfig(newRuntimeConfig);
+    }
+
+    public void RemoveGeneratedAutoentitiesFromConfig()
+    {
+        Dictionary<string, Entity> entities = new(_configLoader.RuntimeConfig!.Entities);
+        List<string> removingEntities = new();
+
+        // Add entities that will be removed to a list first to avoid modifying the collection while iterating over it.
+        foreach ((string name, Entity entity) in entities)
+        {
+            if (entity.IsAutoentity)
+            {
+                removingEntities.Add(name);
+            }
+        }
+
+        // Remove all autoentities from the config.
+        foreach (string name in removingEntities)
+        {
+            entities.Remove(name);
+            _configLoader.RuntimeConfig!.RemoveGeneratedAutoentityNameFromDataSourceName(name);
+        }
+
+        RuntimeConfig newRuntimeConfig = _configLoader.RuntimeConfig! with
+        {
+            Entities = new(entities)
+        };
+        _configLoader.EditRuntimeConfig(newRuntimeConfig);
     }
 }
