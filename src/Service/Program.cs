@@ -158,7 +158,7 @@ namespace Azure.DataApiBuilder.Service
             return StartEngine(args, runMcpStdio, mcpRole: mcpRole);
         }
 
-        public static IHostBuilder CreateHostBuilder(string[] args, bool runMcpStdio, string? mcpRole)
+        public IHostBuilder CreateHostBuilder(string[] args, bool runMcpStdio, string? mcpRole)
         {
             return Host.CreateDefaultBuilder(args)
                 .ConfigureAppConfiguration(builder =>
